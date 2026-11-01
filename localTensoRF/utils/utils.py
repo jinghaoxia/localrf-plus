@@ -123,8 +123,7 @@ def draw_poses(poses, colours):
 
     plt.tight_layout()
     fig.canvas.draw()
-    img = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep="")
-    img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
     plt.close(fig)
     return img # np.zeros([5, 5, 3], dtype=np.uint8)
 

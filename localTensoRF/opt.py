@@ -39,7 +39,8 @@ def config_parser(cmd=None):
     ## training options
     # learning rate
     parser.add_argument("--lr_R_init", type=float, default=5e-3, help="Rotation learning rate")
-    parser.add_argument("--lr_t_init", type=float, default=5e-4, help="Translation learning rate")
+    parser.add_argument("--lr_t_init", type=float, default=None,
+                        help="Translation learning rate; default 5e-4 per normalised unit, i.e. 5e-4 * scene_radius_m per step with --trajectory")
     parser.add_argument("--lr_i_init", type=float, default=0, help="Intrinsics learning rate")
     parser.add_argument("--lr_exposure_init", type=float, default=1e-3, help="Exposure compensation learning rate")
     parser.add_argument("--lr_init", type=float, default=0.02, help="learning rate")
@@ -81,8 +82,8 @@ def config_parser(cmd=None):
     parser.add_argument(
         "--max_drift",
         type=float,
-        default=1,
-        help="Create a new RF once the camera pose shifts this amount w.r.t the last created RF",
+        default=None,
+        help="Create a new RF once the camera pose shifts this amount w.r.t the last created RF; metres with --trajectory (default scene_radius_m), normalised units otherwise (default 1)",
     )
     parser.add_argument(
         "--n_max_frames",
@@ -162,16 +163,6 @@ def config_parser(cmd=None):
         default=None,
         help="specific weights npy file to reload for coarse network",
     )
-    parser.add_argument("--render_only", type=int, default=0)
-    parser.add_argument("--render_test", type=int, default=1)
-    parser.add_argument("--render_path", type=int, default=1)
-    parser.add_argument("--render_from_file", type=str, default="", help="to load camera poses and render from them: https://github.com/facebookresearch/localrf/issues/20")
-
-    ## ------ For saving RAM ------ ##
-    # Set these flags to save your RAM. The final rendered images are still generated and saved.
-    parser.add_argument("--skip_saving_video", action='store_true', help="If set, will not generate rendered video") # default False if not set, will be True if set.
-    parser.add_argument("--skip_TB_images", action='store_true', help="If set, TensorBoard will not show the rendered images.") # default False if not set, will be True if set.
-
 
     # rendering options
     parser.add_argument("--fea2denseAct", type=str, default="softplus")
@@ -186,6 +177,18 @@ def config_parser(cmd=None):
     # Camera model options
     parser.add_argument("--fov", type=float, default=85.6, help="horizontal FoV in degree")
     parser.add_argument("--with_preprocessed_poses", type=int, default=0)
+    parser.add_argument("--trajectory", type=str, default="",
+                        help="explicit tracking TUM trajectory (body poses in metres); replaces transforms.json as the pose prior")
+    parser.add_argument("--pose_prior_lambda_t", type=float, default=0.0,
+                        help="weight on squared translation distance to the tracking prior, per metre^2; a normalised-unit weight w becomes w / scene_radius_m^2 (needs --trajectory)")
+    parser.add_argument("--pose_prior_lambda_r", type=float, default=0.0,
+                        help="weight on squared rotation distance to the tracking prior (needs --trajectory)")
+    parser.add_argument("--scene_radius_m", type=float, default=8.0,
+                        help="metres at which the contraction starts; full spatial resolution lies inside about this radius (used with --trajectory)")
+    parser.add_argument("--uniform_loss_weights", type=int, default=0,
+                        help="1 disables the per-frame Laplacian sharpness weights in the photometric loss")
+    parser.add_argument("--test_pose_opt", type=int, default=1,
+                        help="0 forbids pose-only steps on held-out frames, so they never affect poses")
 
     parser.add_argument("--subsequence", default=[0, -1], type=int, nargs=2)
     parser.add_argument('--frame_step', type=int, default=1, help="Step between retained frames")

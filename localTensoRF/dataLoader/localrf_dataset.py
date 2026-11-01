@@ -35,6 +35,7 @@ class LocalRFDataset(Dataset):
         subsequence=[0, -1],
         test_frame_every=10,
         frame_step=1,
+        transforms=None,
     ):
         self.root_dir = datadir
         self.split = split
@@ -44,31 +45,15 @@ class LocalRFDataset(Dataset):
         self.load_flow = load_flow
         self.frame_step = frame_step
 
-        if with_preprocessed_poses:
+        explicit_transforms = transforms is not None
+        if transforms is None and with_preprocessed_poses:
             with open(os.path.join(self.root_dir, "transforms.json"), 'r') as f:
-                self.transforms = json.load(f)
-            self.image_paths = [os.path.basename(frame_meta["file_path"]) for frame_meta in self.transforms["frames"]]
-            self.image_paths = sorted(self.image_paths)
-            poses_dict = {os.path.basename(frame_meta["file_path"]): frame_meta["transform_matrix"] for frame_meta in self.transforms["frames"]}
-            poses = []
-            for idx, image_path in enumerate(self.image_paths):
-                pose = np.array(poses_dict[image_path], dtype=np.float32)
-                poses.append(pose)
-
-            self.first_pose = np.array(poses_dict[self.image_paths[0]], dtype=np.float32)
-            self.rel_poses = []
-            for idx in range(len(poses)):
-                if idx == 0:
-                    pose = np.eye(4, dtype=np.float32)
-                else:
-                    pose = np.linalg.inv(poses[idx - 1]) @ poses[idx]
-                self.rel_poses.append(pose)
-            self.rel_poses = np.stack(self.rel_poses, axis=0) 
-
-            self.pose_scale = 2e-2 / np.median(np.linalg.norm(self.rel_poses[:, :3, 3], axis=-1))
-            self.rel_poses[:, :3, 3] *= self.pose_scale
-            self.rel_poses = self.rel_poses[::frame_step]
-
+                transforms = json.load(f)
+        poses_dict = None
+        if transforms is not None:
+            self.transforms = transforms
+            poses_dict = {os.path.basename(frame_meta["file_path"]): frame_meta["transform_matrix"] for frame_meta in transforms["frames"]}
+            self.image_paths = sorted(poses_dict)
         else:
             self.image_paths = sorted(os.listdir(os.path.join(self.root_dir, "images")))
         if subsequence != [0, -1]:
@@ -77,12 +62,33 @@ class LocalRFDataset(Dataset):
         self.image_paths = self.image_paths[::frame_step]
         self.all_image_paths = self.image_paths
 
+        if poses_dict is not None:
+            # Motion and scale use only the selected frames, so subsequences and
+            # frame steps stay aligned with the images.
+            if len(self.image_paths) < 2:
+                raise ValueError("pose priors need at least two selected frames")
+            poses = np.stack([np.array(poses_dict[p], dtype=np.float64) for p in self.image_paths])
+            rel = np.stack([np.eye(4)] + [np.linalg.inv(poses[i - 1]) @ poses[i] for i in range(1, len(poses))])
+            if explicit_transforms:
+                # Tracking poses are metric and used unchanged; LocalTensorfs works in units of scene_radius.
+                # The first selected pose keeps the original frame-0 gauge rather than being reset.
+                self.pose_scale = 1.0
+                rel[0] = poses[0]
+            else:
+                # transforms.json priors keep the upstream normalisation: median relative step -> 2e-2.
+                self.pose_scale = 2e-2 / np.median(np.linalg.norm(rel[:, :3, 3], axis=-1))
+                poses[:, :3, 3] *= self.pose_scale
+                rel[:, :3, 3] *= self.pose_scale
+            self.abs_poses = poses.astype(np.float32)
+            self.rel_poses = rel.astype(np.float32)
+
         self.test_mask = []
         self.test_paths = []
         for idx, image_path in enumerate(self.image_paths):
             fbase = os.path.splitext(image_path)[0]
             index = int(fbase) if fbase.isnumeric() else idx
-            if test_frame_every > 0 and index % test_frame_every == 0:
+            # The first selected frame anchors the world, so it is never held out.
+            if test_frame_every > 0 and idx > 0 and index % test_frame_every == 0:
                 self.test_paths.append(image_path)
                 self.test_mask.append(1)
             else:
@@ -270,10 +276,11 @@ class LocalRFDataset(Dataset):
     def get_frame_fbase(self, view_id):
         return list(self.all_fbases.keys())[view_id]
 
-    def sample(self, batch_size, is_refining, optimize_poses, n_views=16):
+    def sample(self, batch_size, is_refining, optimize_poses, n_views=16, allow_test_pose_opt=True):
         active_test_mask = self.test_mask[self.active_frames_bounds[0] : self.active_frames_bounds[1]]
         test_ratio = active_test_mask.mean()
-        if optimize_poses:
+        # Pose-only steps on test views use the held-out images; off for held-out runs.
+        if optimize_poses and allow_test_pose_opt:
             train_test_poses = test_ratio > random.uniform(0, 1)
         else:
             train_test_poses = False

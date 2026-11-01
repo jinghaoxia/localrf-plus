@@ -1,5 +1,10 @@
 # Progressively Optimized Local Radiance Fields for Robust View Synthesis
 
+This fork's `localTensoRF/train.py` now runs progressive visual neural BA initialized
+from an existing visual–LiDAR tracking trajectory. See the [neural BA usage guide](docs/neural-ba-usage.md)
+and [design](docs/neural-ba-v1-design.md). The original LocalRF instructions below
+describe the upstream workflow and do not apply to the new training entry point.
+
 We present an algorithm for reconstructing the radiance field of a large-scale scene from a single casually captured video. The task poses two core challenges. First, most existing radiance field reconstruction approaches rely on accurate pre-estimated camera poses from Structure-from-Motion algorithms, which frequently fail on in-the-wild videos. Second, using a single, global radiance field with finite representational capacity does not scale to longer trajectories in an unbounded scene. For handling unknown poses, we jointly estimate the camera poses with radiance field in a progressive manner. We show that progressive optimization significantly improves the robustness of the reconstruction. For handling large unbounded scenes, we dynamically allocate new local radiance fields trained with frames within a temporal window. This further improves robustness (e.g., performs well even under moderate pose drifts) and allows us to scale to large scenes. Our extensive evaluation on the Tanks and Temples dataset and our collected outdoor dataset, Static Hikes, show that our approach compares favorably with the state-of-the-art.
 
 ### [Project page](https://localrf.github.io/) | [Paper](https://localrf.github.io/localrf.pdf) | [Data](https://drive.google.com/drive/folders/1kGY-VijIbXNsNb7ghEywi1fvkH4BaIEz?usp=share_link)

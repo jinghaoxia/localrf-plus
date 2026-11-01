@@ -5,6 +5,12 @@ models.zip
 extensions
 checkpoints/
 models/
+# The TensorRF implementation is source code required by both training paths.
+!localTensoRF/models/
+localTensoRF/models/*
+!localTensoRF/models/__init__.py
+!localTensoRF/models/tensoRF.py
+!localTensoRF/models/tensorBase.py
 .vscode
 *.pt
 

@@ -383,7 +383,8 @@ def sixD_to_mtx(r):
     b1 = b1 / torch.norm(b1, dim=-1)[:, None]
     b2 = r[..., 1] - torch.sum(b1 * r[..., 1], dim=-1)[:, None] * b1
     b2 = b2 / torch.norm(b2, dim=-1)[:, None]
-    b3 = torch.cross(b1, b2)
+    # dim is explicit: without it torch crosses along the first size-3 axis, which is the frame axis when there are exactly 3 frames.
+    b3 = torch.cross(b1, b2, dim=-1)
 
     return torch.stack([b1, b2, b3], dim=-1)
 

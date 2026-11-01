@@ -53,6 +53,7 @@ class LocalTensorfs(torch.nn.Module):
         camera_prior,
         device,
         lr_upsample_reset,
+        scene_radius=1.0,
         **tensorf_args,
     ):
 
@@ -71,6 +72,11 @@ class LocalTensorfs(torch.nn.Module):
         self.device = torch.device(device)
         self.camera_prior = camera_prior
         self.tensorf_args = tensorf_args
+        if scene_radius <= 0:
+            raise ValueError("scene_radius must be positive")
+        # Poses are in metres; the field works in units of scene_radius, so ray origins are divided by it.
+        # scene_radius=1.0 keeps the upstream normalised units unchanged.
+        self.scene_radius = float(scene_radius)
         self.is_refining = False
         self.lr_upsample_reset = lr_upsample_reset
 
@@ -101,7 +107,13 @@ class LocalTensorfs(torch.nn.Module):
         self.init_focal = torch.nn.Parameter(torch.Tensor([focal]).to(self.device))
 
         self.focal_offset = torch.nn.Parameter(torch.ones(1, device=device))
-        self.center_rel = torch.nn.Parameter(0.5 * torch.ones(2, device=device))
+        center_rel = 0.5 * torch.ones(2, device=device)
+        if self.camera_prior is not None and "principal_point_px" in self.camera_prior["transforms"]:
+            # Calibrated principal point from the tracking input, as a fraction of the full image size.
+            transforms = self.camera_prior["transforms"]
+            cx, cy = transforms["principal_point_px"]
+            center_rel = torch.tensor([cx / transforms["w"], cy / transforms["h"]], device=device)
+        self.center_rel = torch.nn.Parameter(center_rel)
 
         if lr_i_init > 0:
             self.intrinsic_optimizer = torch.optim.Adam([self.focal_offset, self.center_rel], betas=(0.9, 0.99), lr=self.lr_i_init)
@@ -167,13 +179,21 @@ class LocalTensorfs(torch.nn.Module):
 
         if self.camera_prior is not None:
             idx = len(self.r_c2w) - 1
-            rel_pose = self.camera_prior["rel_poses"][idx]
-            last_r_c2w = sixD_to_mtx(self.r_c2w[-1].clone().detach()[None])[0]
-            self.r_c2w[-1] = last_r_c2w @ rel_pose[:3, :3]
-            self.t_c2w[-1].data += last_r_c2w @ rel_pose[:3, 3]
-            
+            if "abs_poses" in self.camera_prior:
+                # Tracking prior: each frame starts from its own tracking pose, so earlier corrections do not chain forward.
+                abs_pose = torch.as_tensor(self.camera_prior["abs_poses"][idx], dtype=torch.float32, device=self.device)
+                self.r_c2w[-1] = mtx_to_sixD(abs_pose[None, :3, :3])[0]
+                self.t_c2w[-1].data.copy_(abs_pose[:3, 3])
+            else:
+                rel_pose = self.camera_prior["rel_poses"][idx]
+                last_r_c2w = sixD_to_mtx(self.r_c2w[-1].clone().detach()[None])[0]
+                self.r_c2w[-1] = last_r_c2w @ rel_pose[:3, :3]
+                self.t_c2w[-1].data += last_r_c2w @ rel_pose[:3, 3]
+
         self.r_optimizers.append(torch.optim.Adam([self.r_c2w[-1]], betas=(0.9, 0.99), lr=self.lr_R_init)) 
-        self.t_optimizers.append(torch.optim.Adam([self.t_c2w[-1]], betas=(0.9, 0.99), lr=self.lr_t_init)) 
+        # Adam's epsilon is a gradient floor. Translation gradients shrink by 1/scene_radius when poses are in metres,
+        # so the floor shrinks too; this keeps the update identical to the normalised-unit run.
+        self.t_optimizers.append(torch.optim.Adam([self.t_c2w[-1]], betas=(0.9, 0.99), lr=self.lr_t_init, eps=1e-8 / self.scene_radius)) 
         self.exp_optimizers.append(torch.optim.Adam([self.exposure[-1]], betas=(0.9, 0.99), lr=self.lr_exposure_init)) 
 
     def optimizer_step_poses_only(self, loss):
@@ -318,6 +338,7 @@ class LocalTensorfs(torch.nn.Module):
             "N_voxel_list": self.N_voxel_per_frame_list,
             "update_AlphaMask_list": self.update_AlphaMask_per_frame_list,
             "lr_upsample_reset": self.lr_upsample_reset,
+            "scene_radius": self.scene_radius,
         }
         kwargs.update(self.tensorfs[0].get_kwargs())
 
@@ -453,7 +474,7 @@ class LocalTensorfs(torch.nn.Module):
                 cam2rf = cam2rfs[rf_id][chunk_idx * chunk : (chunk_idx + 1) * chunk]
 
                 rays_o, rays_d = get_rays_lean(directions_chunk, cam2rf)
-                rays = torch.cat([rays_o, rays_d], -1).view(-1, 6)
+                rays = torch.cat([rays_o / self.scene_radius, rays_d], -1).view(-1, 6)
 
                 rgb_map_t, depth_map_t = self.tensorfs[rf_id](
                     rays,
@@ -472,6 +493,9 @@ class LocalTensorfs(torch.nn.Module):
                     depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
                     depth_map_t * blending_weight_chunk
                 )
+
+        # Depth is accumulated in scene_radius units; return metres, as the flow geometry expects.
+        depth_maps = depth_maps * self.scene_radius
 
         for rf_id, initial_device in zip(active_rf_ids, initial_devices):
             if initial_device != view_ids.device:

@@ -75,13 +75,8 @@ def match_frames(frame_times_us, trajectory):
     return matched
 
 
-def load_tracking(dataset_dir, trajectory_path):
-    """Return LocalRF-style transforms (fl_x, w, h, cx, cy, frames) and the extrinsics.
-
-    frames[i]["transform_matrix"] is the G-frame LocalRF camera-to-world pose of
-    original output frame i, in metres. cx and cy use the ray-centre convention
-    (OpenCV pixel centre + 0.5), so the principal point is the LocalRF centre.
-    """
+def load_calibration(dataset_dir):
+    """Read the rectified camera calibration; pixel centres follow OpenCV."""
     root = Path(dataset_dir)
     calibration = yaml.safe_load((root / "meta/calib.yaml").read_text(encoding="utf-8"))
     camera = calibration["left_camera"]
@@ -90,9 +85,31 @@ def load_tracking(dataset_dir, trajectory_path):
             or not np.allclose(K[2], [0, 0, 1]) or K[0, 1] != 0 or K[1, 0] != 0):
         raise ValueError("left_camera.K must be a finite zero-skew pinhole matrix")
     if not np.allclose(np.asarray(camera["D"], dtype=np.float64), 0, atol=1e-10):
-        raise ValueError("LocalRF tracking input requires rectified images (zero distortion)")
-    if not np.isclose(K[0, 0], K[1, 1], rtol=1e-6, atol=0):
-        raise ValueError("LocalRF uses one focal length; fx and fy must match")
+        raise ValueError("LocalRF input requires rectified images (zero distortion)")
+    if int(camera["width"]) <= 0 or int(camera["height"]) <= 0:
+        raise ValueError("calibrated image dimensions must be positive")
+    return calibration
+
+
+def calibration_intrinsics(calibration):
+    """Full-resolution fx, fy, cx, cy in LocalRF's i+0.5 pixel convention."""
+    camera = calibration["left_camera"]
+    K = np.asarray(camera["K"], dtype=np.float64)
+    return {"fx": float(K[0, 0]), "fy": float(K[1, 1]),
+            "cx": float(K[0, 2] + 0.5), "cy": float(K[1, 2] + 0.5),
+            "w": int(camera["width"]), "h": int(camera["height"])}
+
+
+def load_tracking(dataset_dir, trajectory_path):
+    """Return calibrated intrinsics, camera poses and export extrinsics.
+
+    frames[i]["transform_matrix"] is the G-frame LocalRF camera-to-world pose of
+    original output frame i, in metres. cx and cy use the ray-centre convention
+    (OpenCV pixel centre + 0.5), so the principal point is the LocalRF centre.
+    """
+    root = Path(dataset_dir)
+    calibration = load_calibration(root)
+    intrinsics = calibration_intrinsics(calibration)
     T_body_cam = _check_transform(calibration["camera_to_body"]["T_body_cam"], "T_body_cam")
     origin_us = int(calibration["time"]["origin_utc_us"])
 
@@ -121,9 +138,8 @@ def load_tracking(dataset_dir, trajectory_path):
         frames.append({"file_path": f"images/{index:05d}.png",
                        "transform_matrix": (T_G_world @ T_world_cam).tolist(),
                        "timestamp_us": time_us})
-    transforms = {"fl_x": float(K[0, 0]), "w": int(camera["width"]), "h": int(camera["height"]),
-                  "principal_point_px": [float(K[0, 2] + 0.5), float(K[1, 2] + 0.5)], "frames": frames}
-    return {"transforms": transforms, "T_world_G": T_world_G, "T_body_cam": T_body_cam}
+    return {"frames": frames, "intrinsics": intrinsics,
+            "T_world_G": T_world_G, "T_body_cam": T_body_cam}
 
 
 def camera_to_body(cam2world_G, T_world_G, T_body_cam):

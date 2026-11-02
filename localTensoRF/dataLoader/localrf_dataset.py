@@ -7,11 +7,12 @@ import random
 import numpy as np
 import torch
 import cv2
-import re
 
 from joblib import delayed, Parallel
 from torch.utils.data import Dataset
-from utils.utils import decode_flow
+from pathlib import Path
+from dataLoader.tracking_poses import (load_tracking, load_calibration, calibration_intrinsics,
+                                       camera_to_body, write_tum)
 import json
 
 def concatenate_append(old, new, dim):
@@ -29,58 +30,92 @@ class LocalRFDataset(Dataset):
         frames_chunk=20,
         downsampling=-1,
         load_depth=False,
-        load_flow=False,
         with_preprocessed_poses=False,
         n_init_frames=7,
         subsequence=[0, -1],
         test_frame_every=10,
         frame_step=1,
-        transforms=None,
+        trajectory=None,
+        depth_scale=None,
+        uniform_loss_weights=False,
     ):
         self.root_dir = datadir
         self.split = split
         self.frames_chunk = max(frames_chunk, n_init_frames)
         self.downsampling = downsampling
         self.load_depth = load_depth
-        self.load_flow = load_flow
+        self.depth_scale = depth_scale
+        self.uniform_loss_weights = uniform_loss_weights
         self.frame_step = frame_step
 
-        explicit_transforms = transforms is not None
-        if transforms is None and with_preprocessed_poses:
-            with open(os.path.join(self.root_dir, "transforms.json"), 'r') as f:
-                transforms = json.load(f)
-        poses_dict = None
-        if transforms is not None:
-            self.transforms = transforms
-            poses_dict = {os.path.basename(frame_meta["file_path"]): frame_meta["transform_matrix"] for frame_meta in transforms["frames"]}
-            self.image_paths = sorted(poses_dict)
+        if frame_step < 1 or (downsampling != -1 and downsampling <= 0):
+            raise ValueError("frame_step and downsampling must be positive (or downsampling=-1)")
+        if n_init_frames < 1 or frames_chunk < 1:
+            raise ValueError("frame counts must be positive")
+        if depth_scale is not None and (not np.isfinite(depth_scale) or depth_scale <= 0):
+            raise ValueError("depth_scale must be a finite positive number of metres per PNG unit")
+        self.tracking = load_tracking(datadir, trajectory) if trajectory else None
+        self.camera_prior = None
+        self.pose_scale = 1.0
+        root = Path(datadir)
+        transforms_path = root / "transforms.json"
+        transforms = None
+        if self.tracking is not None:
+            frames = self.tracking["frames"]
+            camera = self.tracking["intrinsics"]
         else:
-            self.image_paths = sorted(os.listdir(os.path.join(self.root_dir, "images")))
-        if subsequence != [0, -1]:
-            self.image_paths = self.image_paths[subsequence[0]:subsequence[1]]
+            if transforms_path.is_file():
+                transforms = json.loads(transforms_path.read_text())
+            if with_preprocessed_poses and transforms is None:
+                raise FileNotFoundError(transforms_path)
+            frames = transforms["frames"] if with_preprocessed_poses else None
+            if (root / "meta/calib.yaml").is_file():
+                camera = calibration_intrinsics(load_calibration(root))
+            elif transforms is not None:
+                # Legacy LocalRF metadata: fl_y may be omitted for a square-pixel camera.
+                w, h = transforms["w"], transforms["h"]
+                cx, cy = transforms.get("principal_point_px", [
+                    transforms.get("cx", w / 2 - 0.5) + 0.5,
+                    transforms.get("cy", h / 2 - 0.5) + 0.5])
+                camera = {"fx": transforms["fl_x"], "fy": transforms.get("fl_y", transforms["fl_x"]),
+                          "cx": cx, "cy": cy, "w": w, "h": h}
+            else:
+                raise FileNotFoundError("camera intrinsics require meta/calib.yaml or transforms.json")
+        if not np.isfinite(list(camera.values())).all() or min(camera[k] for k in ("fx", "fy", "w", "h")) <= 0:
+            raise ValueError("camera intrinsics and image dimensions must be finite, with positive focal lengths")
+        if self.load_depth and self.tracking is None:
+            raise ValueError("metric dense depth requires an explicit tracking trajectory; normalised poses are unsupported")
+        self.source_wh = (int(camera["w"]), int(camera["h"]))
+        self.image_paths = (sorted(Path(f["file_path"]).name for f in frames) if frames is not None else
+                            sorted(f.name for f in (root / "images").iterdir()
+                                   if f.suffix.lower() in (".png", ".jpg", ".jpeg") and f.is_file()))
+        start, end = subsequence
+        if start < 0 or (end != -1 and end <= start):
+            raise ValueError("subsequence must be [start, end) with 0 <= start < end (or end=-1)")
+        self.image_paths = self.image_paths[start:None if end == -1 else end:frame_step]
+        if not self.image_paths:
+            raise ValueError("no selected images")
 
-        self.image_paths = self.image_paths[::frame_step]
-        self.all_image_paths = self.image_paths
-
-        if poses_dict is not None:
-            # Motion and scale use only the selected frames, so subsequences and
-            # frame steps stay aligned with the images.
+        if frames is not None:
             if len(self.image_paths) < 2:
                 raise ValueError("pose priors need at least two selected frames")
-            poses = np.stack([np.array(poses_dict[p], dtype=np.float64) for p in self.image_paths])
+            by_name = {Path(f["file_path"]).name: f for f in frames}
+            poses = np.array([by_name[name]["transform_matrix"] for name in self.image_paths], dtype=np.float64)
             rel = np.stack([np.eye(4)] + [np.linalg.inv(poses[i - 1]) @ poses[i] for i in range(1, len(poses))])
-            if explicit_transforms:
-                # Tracking poses are metric and used unchanged; LocalTensorfs works in units of scene_radius.
-                # The first selected pose keeps the original frame-0 gauge rather than being reset.
-                self.pose_scale = 1.0
-                rel[0] = poses[0]
+            if self.tracking is not None:
+                rel[0] = poses[0]  # Keep the original frame-0 gauge for nonzero-start subsequences.
+                self.timestamps_us = [by_name[name]["timestamp_us"] for name in self.image_paths]
             else:
-                # transforms.json priors keep the upstream normalisation: median relative step -> 2e-2.
-                self.pose_scale = 2e-2 / np.median(np.linalg.norm(rel[:, :3, 3], axis=-1))
+                median_step = np.median(np.linalg.norm(rel[:, :3, 3], axis=-1))
+                if median_step <= 0:
+                    raise ValueError("cannot normalise a transforms.json trajectory with zero median motion")
+                self.pose_scale = 2e-2 / median_step
                 poses[:, :3, 3] *= self.pose_scale
                 rel[:, :3, 3] *= self.pose_scale
             self.abs_poses = poses.astype(np.float32)
             self.rel_poses = rel.astype(np.float32)
+            self.camera_prior = ({"abs_poses": self.abs_poses} if self.tracking is not None else
+                                 {"rel_poses": torch.from_numpy(self.rel_poses)})
 
         self.test_mask = []
         self.test_paths = []
@@ -101,19 +136,42 @@ class LocalRFDataset(Dataset):
         self.num_images = len(self.image_paths)
         self.all_fbases = {os.path.splitext(image_path)[0]: idx for idx, image_path in enumerate(self.image_paths)}
 
-        self.white_bg = False
-
         self.near_far = [0.1, 1e3] # Dummi
         self.scene_bbox = 2 * torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
 
         self.all_rgbs = None
-        self.all_invdepths = None
-        self.all_fwd_flow, self.all_fwd_mask, self.all_bwd_flow, self.all_bwd_mask = None, None, None, None
+        self.all_depths = None
+        self.all_depth_valid = None
         self.all_loss_weights = None
 
         self.active_frames_bounds = [0, 0]
         self.loaded_frames = 0
+        if self.num_images == 0:
+            raise ValueError("no images in the requested split")
+        if split == "test" and frames is not None:
+            # Pose arrays below are selected using the original train/test mask, not test-local indices.
+            selected = np.flatnonzero(self.test_mask)
+            self.abs_poses = self.abs_poses[selected]
+            self.rel_poses = self.rel_poses[selected]
+            self.camera_prior = {"abs_poses": self.abs_poses}
+            if self.tracking is not None:
+                self.timestamps_us = [self.timestamps_us[i] for i in selected]
         self.activate_frames(n_init_frames)
+        sx, sy = self.img_wh[0] / camera["w"], self.img_wh[1] / camera["h"]
+        self.intrinsics = {"fx": camera["fx"] * sx, "fy": camera["fy"] * sy,
+                           "cx": camera["cx"] * sx, "cy": camera["cy"] * sy}
+
+    def export_trajectory(self, path, cam2world):
+        """Export the selected, optimised camera poses as metric body poses."""
+        if self.tracking is None:
+            raise ValueError("trajectory export requires tracking metadata")
+        cam2world = np.asarray(cam2world, dtype=np.float64)
+        if cam2world.shape != (len(self.image_paths), 3, 4):
+            raise ValueError("export must contain exactly one 3x4 pose per selected image")
+        bottom = np.tile([[[0., 0., 0., 1.]]], (len(cam2world), 1, 1))
+        poses = np.concatenate([cam2world, bottom], axis=1)
+        body = camera_to_body(poses, self.tracking["T_world_G"], self.tracking["T_body_cam"])
+        write_tum(path, self.timestamps_us, body)
 
 
     def activate_frames(self, n_frames=1):
@@ -136,12 +194,8 @@ class LocalRFDataset(Dataset):
 
         self.all_rgbs = self.all_rgbs[n_frames * self.n_px_per_frame:] 
         if self.load_depth:
-            self.all_invdepths = self.all_invdepths[n_frames * self.n_px_per_frame:]
-        if self.load_flow:
-            self.all_fwd_flow = self.all_fwd_flow[n_frames * self.n_px_per_frame:]
-            self.all_fwd_mask = self.all_fwd_mask[n_frames * self.n_px_per_frame:]
-            self.all_bwd_flow = self.all_bwd_flow[n_frames * self.n_px_per_frame:]
-            self.all_bwd_mask = self.all_bwd_mask[n_frames * self.n_px_per_frame:]
+            self.all_depths = self.all_depths[n_frames * self.n_px_per_frame:]
+            self.all_depth_valid = self.all_depth_valid[n_frames * self.n_px_per_frame:]
         self.all_loss_weights = self.all_loss_weights[n_frames * self.n_px_per_frame:]
 
 
@@ -155,69 +209,51 @@ class LocalRFDataset(Dataset):
                 motion_mask_path = os.path.join(self.root_dir, "masks/all.png")
 
 
-            img = cv2.imread(image_path)[..., ::-1]
-            img = img.astype(np.float32) / 255
+            img = cv2.imread(image_path)
+            if img is None:
+                raise FileNotFoundError(image_path)
+            if img.shape[1::-1] != self.source_wh:
+                raise ValueError(f"{image_path}: image dimensions do not match calibration {self.source_wh}")
+            img = img[..., ::-1].astype(np.float32) / 255
             if self.downsampling != -1:
-                scale = 1 / self.downsampling
-                img = cv2.resize(img, None, 
-                    fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                img = cv2.resize(img, None, fx=1 / self.downsampling, fy=1 / self.downsampling,
+                                 interpolation=cv2.INTER_AREA)
 
+            depth, depth_valid = None, None
             if self.load_depth:
-                invdepth_path = os.path.join(self.root_dir, "depth", 
-                    f"{os.path.splitext(self.image_paths[i])[0]}.png")
-                invdepth = cv2.imread(invdepth_path, -1).astype(np.float32)
-                invdepth = cv2.resize(
-                    invdepth, tuple(img.shape[1::-1]), interpolation=cv2.INTER_AREA)
-            else:
-                invdepth = None
-
-            if self.load_flow:
-                glob_idx = self.all_image_paths.index(self.image_paths[i])
-                if glob_idx+1 < len(self.all_image_paths):
-                    fwd_flow_path = self.all_image_paths[glob_idx+1]
+                base = Path(self.root_dir) / "depth" / Path(self.image_paths[i]).stem
+                candidates = [base.with_suffix(ext) for ext in (".png", ".npy") if base.with_suffix(ext).is_file()]
+                if len(candidates) != 1:
+                    raise ValueError(f"{base}: expected exactly one depth .png or .npy")
+                path = candidates[0]
+                if path.suffix == ".png":
+                    if self.depth_scale is None:
+                        raise ValueError("PNG depth requires explicit --depth_scale in metres per integer unit")
+                    raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                    if raw is None or raw.dtype != np.uint16 or raw.ndim != 2:
+                        raise ValueError(f"{path}: depth must be a single-channel uint16 PNG")
+                    depth = raw.astype(np.float32) * self.depth_scale
                 else:
-                    fwd_flow_path = self.all_image_paths[0]
-                if self.frame_step != 1:
-                    fwd_flow_path = os.path.join(self.root_dir, "flow_ds", 
-                        f"fwd_step{self.frame_step}_{os.path.splitext(fwd_flow_path)[0]}.png")
-                    bwd_flow_path = os.path.join(self.root_dir, "flow_ds", 
-                        f"bwd_step{self.frame_step}_{os.path.splitext(self.image_paths[i])[0]}.png")
-                else:
-                    fwd_flow_path = os.path.join(self.root_dir, "flow_ds", 
-                        f"fwd_{os.path.splitext(fwd_flow_path)[0]}.png")
-                    bwd_flow_path = os.path.join(self.root_dir, "flow_ds", 
-                        f"bwd_{os.path.splitext(self.image_paths[i])[0]}.png")
-                encoded_fwd_flow = cv2.imread(fwd_flow_path, cv2.IMREAD_UNCHANGED)
-                encoded_bwd_flow = cv2.imread(bwd_flow_path, cv2.IMREAD_UNCHANGED)
-                flow_scale = img.shape[0] / encoded_fwd_flow.shape[0] 
-                encoded_fwd_flow = cv2.resize(
-                    encoded_fwd_flow, tuple(img.shape[1::-1]), interpolation=cv2.INTER_AREA)
-                encoded_bwd_flow = cv2.resize(
-                    encoded_bwd_flow, tuple(img.shape[1::-1]), interpolation=cv2.INTER_AREA)            
-                fwd_flow, fwd_mask = decode_flow(encoded_fwd_flow)
-                bwd_flow, bwd_mask = decode_flow(encoded_bwd_flow)
-                fwd_flow = fwd_flow * flow_scale
-                bwd_flow = bwd_flow * flow_scale
-            else:
-                fwd_flow, fwd_mask, bwd_flow, bwd_mask = None, None, None, None
+                    depth = np.load(path, allow_pickle=False)
+                    if depth.ndim != 2 or not np.issubdtype(depth.dtype, np.floating):
+                        raise ValueError(f"{path}: depth must be a 2D floating-point array in metres")
+                    depth = depth.astype(np.float32)
+                # Nearest preserves invalid pixels and avoids blending foreground/background depths.
+                depth = cv2.resize(depth, tuple(img.shape[1::-1]), interpolation=cv2.INTER_NEAREST)
+                depth_valid = np.isfinite(depth) & (depth > 0)
+                depth = np.where(depth_valid, depth, 0).astype(np.float32)
 
             if os.path.isfile(motion_mask_path):
                 mask = cv2.imread(motion_mask_path, cv2.IMREAD_UNCHANGED)
                 if len(mask.shape) != 2:
                     mask = mask[..., 0]
-                mask = cv2.resize(mask, tuple(img.shape[1::-1]), interpolation=cv2.INTER_AREA) > 0
+                mask = cv2.resize(mask, tuple(img.shape[1::-1]), interpolation=cv2.INTER_NEAREST) > 0
             else:
                 mask = None
 
-            return {
-                "img": img, 
-                "invdepth": invdepth,
-                "fwd_flow": fwd_flow,
-                "fwd_mask": fwd_mask,
-                "bwd_flow": bwd_flow,
-                "bwd_mask": bwd_mask,
-                "mask": mask,
-            }
+            if depth_valid is not None and mask is not None:
+                depth_valid &= mask
+            return {"img": img, "depth": depth, "depth_valid": depth_valid, "mask": mask}
 
         n_frames_to_load = min(self.frames_chunk, self.num_images - self.loaded_frames)
         all_data = Parallel(n_jobs=-1, backend="threading")(
@@ -225,17 +261,14 @@ class LocalRFDataset(Dataset):
         )
         self.loaded_frames += n_frames_to_load
         all_rgbs = [data["img"] for data in all_data]
-        all_invdepths = [data["invdepth"] for data in all_data]
-        all_fwd_flow = [data["fwd_flow"] for data in all_data]
-        all_fwd_mask = [data["fwd_mask"] for data in all_data]
-        all_bwd_flow = [data["bwd_flow"] for data in all_data]
-        all_bwd_mask = [data["bwd_mask"] for data in all_data]
+        all_depths = [data["depth"] for data in all_data]
+        all_depth_valid = [data["depth_valid"] for data in all_data]
         all_mask = [data["mask"] for data in all_data]
 
         all_laplacian = [
-                np.ones_like(img[..., 0]) * cv2.Laplacian(
+                np.ones_like(img[..., 0]) * (1.0 if self.uniform_loss_weights else max(1e-6, cv2.Laplacian(
                             cv2.cvtColor((img*255).astype(np.uint8), cv2.COLOR_RGB2GRAY), cv2.CV_32F
-                        ).var()
+                        ).var()))
             for img in all_rgbs
         ]
         all_loss_weights = [laplacian if mask is None else laplacian * mask for laplacian, mask in zip(all_laplacian, all_mask)]
@@ -246,21 +279,13 @@ class LocalRFDataset(Dataset):
         if self.split != "train":
             self.all_rgbs = np.stack(all_rgbs, 0)
             if self.load_depth:
-                self.all_invdepths = np.stack(all_invdepths, 0)
-            if self.load_flow:
-                self.all_fwd_flow = np.stack(all_fwd_flow, 0)
-                self.all_fwd_mask = np.stack(all_fwd_mask, 0)
-                self.all_bwd_flow = np.stack(all_bwd_flow, 0)
-                self.all_bwd_mask = np.stack(all_bwd_mask, 0)
+                self.all_depths = np.stack(all_depths, 0)
+                self.all_depth_valid = np.stack(all_depth_valid, 0)
         else:
             self.all_rgbs = concatenate_append(self.all_rgbs, all_rgbs, 3)
             if self.load_depth:
-                self.all_invdepths = concatenate_append(self.all_invdepths, all_invdepths, 1)
-            if self.load_flow:
-                self.all_fwd_flow = concatenate_append(self.all_fwd_flow, all_fwd_flow, 2)
-                self.all_fwd_mask = concatenate_append(self.all_fwd_mask, all_fwd_mask, 1)
-                self.all_bwd_flow = concatenate_append(self.all_bwd_flow, all_bwd_flow, 2)
-                self.all_bwd_mask = concatenate_append(self.all_bwd_mask, all_bwd_mask, 1)
+                self.all_depths = concatenate_append(self.all_depths, all_depths, 1)
+                self.all_depth_valid = concatenate_append(self.all_depth_valid, all_depth_valid, 1)
             self.all_loss_weights = concatenate_append(self.all_loss_weights, all_loss_weights, 1)
 
 
@@ -269,14 +294,13 @@ class LocalRFDataset(Dataset):
 
     def __getitem__(self, i):
         raise NotImplementedError
-        idx = np.random.randint(self.sampling_bound[0], self.sampling_bound[1])
-
-        return {"rgbs": self.all_rgbs[idx], "idx": idx}
 
     def get_frame_fbase(self, view_id):
         return list(self.all_fbases.keys())[view_id]
 
-    def sample(self, batch_size, is_refining, optimize_poses, n_views=16, allow_test_pose_opt=True):
+    def sample(self, batch_size, is_refining, optimize_poses, n_views=16, allow_test_pose_opt=False):
+        if batch_size < 1 or batch_size % n_views:
+            raise ValueError("batch_size must be a positive multiple of n_views")
         active_test_mask = self.test_mask[self.active_frames_bounds[0] : self.active_frames_bounds[1]]
         test_ratio = active_test_mask.mean()
         # Pose-only steps on test views use the held-out images; off for held-out runs.
@@ -291,6 +315,8 @@ class LocalRFDataset(Dataset):
             self.active_frames_bounds[1], 
             dtype=np.int64)[inclusion_mask == 1]
         
+        if inclusion_mask.sum() == 0:
+            raise ValueError("active window contains no eligible training frames")
         raw_samples = np.random.randint(0, inclusion_mask.sum(), n_views, dtype=np.int64)
 
         # Force having the last views during coarse optimization
@@ -312,11 +338,8 @@ class LocalRFDataset(Dataset):
         return {
             "rgbs": self.all_rgbs[idx_sample], 
             "loss_weights": self.all_loss_weights[idx_sample], 
-            "invdepths": self.all_invdepths[idx_sample] if self.load_depth else None,
-            "fwd_flow": self.all_fwd_flow[idx_sample] if self.load_flow else None,
-            "fwd_mask": self.all_fwd_mask[idx_sample] if self.load_flow else None,
-            "bwd_flow": self.all_bwd_flow[idx_sample] if self.load_flow else None,
-            "bwd_mask": self.all_bwd_mask[idx_sample] if self.load_flow else None,
+            "depths": self.all_depths[idx_sample] if self.load_depth else None,
+            "depth_valid": self.all_depth_valid[idx_sample] if self.load_depth else None,
             "idx": idx,
             "view_ids": view_ids,
             "train_test_poses": train_test_poses,

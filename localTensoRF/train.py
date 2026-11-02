@@ -2,12 +2,12 @@
 # Copyright (c) 2022 Anpei Chen
 
 import os
+from pathlib import Path
+import random
 import warnings
 
-import cv2
 import numpy as np
 import torch
-from tqdm.auto import tqdm
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 import json
@@ -16,14 +16,11 @@ import time
 
 from torch.utils.tensorboard import SummaryWriter
 
-sys.path.append("localTensoRF")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dataLoader.localrf_dataset import LocalRFDataset
-from dataLoader.tracking_poses import camera_to_body, load_tracking, write_tum
 from local_tensorfs import LocalTensorfs
 from opt import config_parser
-from utils.utils import (get_fwd_bwd_cam2cams)
-from utils.utils import (N_to_reso, TVLoss, draw_poses, get_pred_flow,
-                         compute_depth_loss)
+from utils.utils import N_to_reso, TVLoss, draw_poses, dense_depth_loss
 
 
 def pose_prior_loss(local_tensorfs, prior_poses, lambda_t, lambda_r):
@@ -45,40 +42,98 @@ def pose_prior_loss(local_tensorfs, prior_poses, lambda_t, lambda_r):
     return lambda_t * translation + lambda_r * rotation
 
 
-def export_tracking_trajectory(args, local_tensorfs, train_dataset, tracking, logfolder):
+def active_gradient_groups(model, optimize_poses, poses_only=False):
+    """Parameters stepped by the current window, separated by role and units."""
+    groups = {}
+    current = len(model.tensorfs) - 1
+    if not poses_only:
+        field = model.tensorfs[-1]
+        density = list(field.density_plane) + list(field.density_line)
+        density_ids = {id(p) for p in density}
+        groups["density"] = density
+        groups["appearance"] = [p for p in field.parameters() if id(p) not in density_ids and p.requires_grad]
+    if model.rf_iter[-1] < model.n_iters:
+        active = [i for i, linked in enumerate(model.pose_linked_rf) if linked == current]
+        if optimize_poses:
+            for name, optimizers in (("rotation", model.r_optimizers), ("translation", model.t_optimizers)):
+                groups[name] = [p for i in active for group in optimizers[i].param_groups
+                                if group["lr"] > 0 for p in group["params"] if p.requires_grad]
+        if not poses_only and model.lr_exposure_init > 0:
+            groups["exposure"] = [model.exposure[i] for i in active]
+    if not poses_only and model.lr_i_init > 0 and current == 0 and model.is_refining:
+        groups["intrinsics"] = [model.focal_offset, model.center_rel]
+    return {name: params for name, params in groups.items() if params}
+
+
+def loss_gradient_norms(losses, parameter_groups):
+    """L2 and maximum absolute gradients of weighted terms, without altering .grad.
+
+    Each loss uses the same forward samples. Groups are not combined across units.
+    autograd.grad retains the graph for the usual training backward/optimiser step.
+    """
+    parameters = [p for group in parameter_groups.values() for p in group]
+    metrics = {}
+    if not parameters:
+        return metrics
+    for loss_name, loss in losses.items():
+        if loss.requires_grad:
+            grads = torch.autograd.grad(loss, parameters, allow_unused=True, retain_graph=True)
+        else:
+            grads = [None] * len(parameters)
+        offset = 0
+        for group_name, group in parameter_groups.items():
+            values = [g.detach() for g in grads[offset:offset+len(group)] if g is not None]
+            offset += len(group)
+            if values:
+                # float64 accumulation avoids overflow when diagnosing a float32 gradient spike.
+                l2 = torch.stack([g.double().square().sum() for g in values]).sum().sqrt().item()
+                maximum = max(g.abs().max().item() for g in values)
+            else:
+                l2, maximum = 0., 0.
+            metrics[f"grad/{loss_name}/{group_name}_l2"] = l2
+            metrics[f"grad/{loss_name}/{group_name}_max"] = maximum
+    return metrics
+
+
+def export_tracking_trajectory(args, local_tensorfs, train_dataset, logfolder):
     """Write optimised camera poses as a metric body-frame TUM trajectory."""
     trajectory_path = f"{logfolder}/trajectory.tum"
     cam2world = local_tensorfs.get_cam2world().detach().cpu().numpy().astype(np.float64)
-    # get_cam2world returns [N,3,4]; complete it to homogeneous [N,4,4] before inverting.
-    bottom = np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (len(cam2world), 1, 1))
-    cam2world = np.concatenate([cam2world, bottom], axis=1)
-    body_poses = camera_to_body(cam2world, tracking["T_world_G"], tracking["T_body_cam"])
-    timestamps = {os.path.basename(f["file_path"]): f["timestamp_us"] for f in tracking["transforms"]["frames"]}
-    stamps = [timestamps[p] for p in train_dataset.image_paths]
-    if len(stamps) != len(body_poses):
-        # zip() would silently truncate the trajectory, so check the counts first.
-        raise RuntimeError(f"{len(body_poses)} poses for {len(stamps)} selected frames")
-    write_tum(trajectory_path, stamps, body_poses)
+    train_dataset.export_trajectory(trajectory_path, cam2world)
     with open(f"{logfolder}/tracking_export.json", "w", encoding="utf-8") as f:
         json.dump({"trajectory": os.path.abspath(args.trajectory), "units": "metres",
                    "scene_radius_m": local_tensorfs.scene_radius, "max_drift_m": args.max_drift,
                    "lr_t_init_m_per_step": args.lr_t_init, "lr_R_init": args.lr_R_init,
                    "pose_prior_lambda_t_per_m2": args.pose_prior_lambda_t,
-                   "pose_prior_lambda_r": args.pose_prior_lambda_r}, f, indent=2)
+                   "pose_prior_lambda_r": args.pose_prior_lambda_r,
+                   "seed": args.seed,
+                   "depth_weight": args.depth_weight, "depth_scale_m_per_unit": args.depth_scale,
+                   "depth_definition": "in-scene expected camera z in metres",
+                   "intrinsics": train_dataset.intrinsics}, f, indent=2)
     print(f"tracking trajectory written to {trajectory_path}", flush=True)
 
 
 def reconstruction(args):
-    # An explicit tracking trajectory replaces the transforms.json prior. Its poses are metric; the model
-    # works in units of scene_radius, so the unit-dependent defaults are derived here.
-    tracking = load_tracking(args.datadir, args.trajectory) if args.trajectory else None
-    if tracking is not None and os.path.exists(f"{args.logdir}/trajectory.tum"):
-        raise FileExistsError(f"refusing to overwrite {args.logdir}/trajectory.tum; choose a new --logdir")
-    scene_radius = args.scene_radius_m if tracking is not None else 1.0
+    if os.path.exists(args.logdir) and os.listdir(args.logdir):
+        raise FileExistsError(f"refusing to write into non-empty {args.logdir}; choose a new --logdir")
+    if args.n_overlap < 1 or args.n_init_frames < 1:
+        raise ValueError("n_overlap and n_init_frames must be at least 1")
+    if args.grad_log_every < 0:
+        raise ValueError("grad_log_every must be nonnegative")
+    if args.batch_size <= 0 or args.batch_size % 16:
+        raise ValueError("batch_size must be a positive multiple of 16")
+    if not np.isfinite(args.depth_weight) or args.depth_weight < 0:
+        raise ValueError("depth_weight must be finite and nonnegative")
+    if (args.pose_prior_lambda_t > 0 or args.pose_prior_lambda_r > 0) and not args.trajectory:
+        raise ValueError("pose priors require --trajectory")
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    scene_radius = args.scene_radius_m if args.trajectory else 1.0
     if args.max_drift is None:
-        args.max_drift = scene_radius  # upstream default: 1 normalised unit, which is one scene radius
+        args.max_drift = scene_radius
     if args.lr_t_init is None:
-        args.lr_t_init = 5e-4 * scene_radius  # upstream default: 5e-4 per normalised unit, now per metre
+        args.lr_t_init = 5e-4 * scene_radius
 
     # Apply speedup factors
     args.n_iters_per_frame = int(args.n_iters_per_frame / args.refinement_speedup_factor)
@@ -90,7 +145,6 @@ def reconstruction(args):
     args.add_frames_every = int(args.add_frames_every / args.prog_speedup_factor)
     args.lr_R_init = args.lr_R_init * args.prog_speedup_factor
     args.lr_t_init = args.lr_t_init * args.prog_speedup_factor
-    args.loss_flow_weight_inital = args.loss_flow_weight_inital * args.prog_speedup_factor
     args.L1_weight = args.L1_weight * args.prog_speedup_factor
     args.TV_weight_density = args.TV_weight_density * args.prog_speedup_factor
     args.TV_weight_app = args.TV_weight_app * args.prog_speedup_factor
@@ -101,13 +155,14 @@ def reconstruction(args):
         split="train",
         downsampling=args.downsampling,
         test_frame_every=args.test_frame_every,
-        load_depth=args.loss_depth_weight_inital > 0,
-        load_flow=args.loss_flow_weight_inital > 0,
+        load_depth=args.depth_weight > 0,
+        depth_scale=args.depth_scale,
+        uniform_loss_weights=args.uniform_loss_weights,
         with_preprocessed_poses=args.with_preprocessed_poses,
         n_init_frames=args.n_init_frames,
         subsequence=args.subsequence,
         frame_step=args.frame_step,
-        transforms=tracking["transforms"] if tracking is not None else None,
+        trajectory=args.trajectory,
     )
     near_far = train_dataset.near_far
 
@@ -125,15 +180,6 @@ def reconstruction(args):
     # init parameters
     aabb = train_dataset.scene_bbox.to(args.device)
     reso_cur = N_to_reso(args.N_voxel_init, aabb)
-
-    # TODO: Add midpoint loading
-    # if args.ckpt is not None:
-    #     ckpt = torch.load(args.ckpt, map_location=args.device)
-    #     kwargs = ckpt["kwargs"]
-    #     kwargs.update({"device": args.device})
-    #     tensorf = eval(args.model_name)(**kwargs)
-    #     tensorf.load(ckpt)
-    # else:
 
     print("lr decay", args.lr_decay_target_ratio)
 
@@ -153,20 +199,9 @@ def reconstruction(args):
         usamp_idx: round(N_voxel**(1/3))**3 for usamp_idx, N_voxel in zip(upsamp_list, N_voxel_list)
     }
 
-    if tracking is not None or args.with_preprocessed_poses:
-        camera_prior = {
-            "rel_poses": torch.from_numpy(train_dataset.rel_poses).to(args.device),
-            "transforms": train_dataset.transforms
-        }
-        if tracking is not None:
-            camera_prior["abs_poses"] = train_dataset.abs_poses
-    else:
-        camera_prior = None
-
-
     local_tensorfs = LocalTensorfs(
-        camera_prior=camera_prior,
-        fov=args.fov,
+        camera_prior=train_dataset.camera_prior,
+        intrinsics=train_dataset.intrinsics,
         n_init_frames=min(args.n_init_frames, train_dataset.num_images),
         n_overlap=args.n_overlap,
         WH=train_dataset.img_wh,
@@ -203,7 +238,7 @@ def reconstruction(args):
         scene_radius=scene_radius,
     )
     local_tensorfs = local_tensorfs.to(args.device)
-    if tracking is not None:
+    if train_dataset.tracking is not None:
         # The first selected frame fixes the gauge: its pose stays at the tracking value.
         for optimizer in (local_tensorfs.r_optimizers[0], local_tensorfs.t_optimizers[0]):
             for param_group in optimizer.param_groups:
@@ -226,14 +261,10 @@ def reconstruction(args):
         view_ids = torch.from_numpy(data_blob["view_ids"]).to(args.device)
         rgb_train = torch.from_numpy(data_blob["rgbs"]).to(args.device)
         loss_weights = torch.from_numpy(data_blob["loss_weights"]).to(args.device)
-        if args.uniform_loss_weights:
-            # Plain L1 over sampled pixels: no per-frame Laplacian sharpness weighting.
-            loss_weights = torch.ones_like(loss_weights)
         train_test_poses = data_blob["train_test_poses"]
         ray_idx = torch.from_numpy(data_blob["idx"]).to(args.device)
-        reg_loss_weight = local_tensorfs.lr_factor ** (local_tensorfs.rf_iter[-1])
 
-        rgb_map, depth_map, directions, ij = local_tensorfs(
+        rgb_map, depth_map, opacity_map = local_tensorfs(
             ray_idx,
             view_ids,
             W,
@@ -243,74 +274,50 @@ def reconstruction(args):
         )
 
         # loss
-        loss = 0.25 * ((torch.abs(rgb_map - rgb_train)) * loss_weights) / loss_weights.mean()
-               
-        loss = loss.mean()
+        # Uniform weighting still respects observation masks; an all-masked batch contributes zero.
+        loss = 0.25 * (torch.abs(rgb_map - rgb_train) * loss_weights).sum()
+        loss = loss / (3 * loss_weights.sum()).clamp_min(1e-8)
         total_loss = loss
+        loss_terms = {"rgb": loss}
         writer.add_scalar("train/rgb_loss", loss, global_step=iteration)
 
-        if tracking is not None and optimize_poses and not train_test_poses and (
+        if train_dataset.tracking is not None and optimize_poses and not train_test_poses and (
                 args.pose_prior_lambda_t > 0 or args.pose_prior_lambda_r > 0):
             prior_loss = pose_prior_loss(local_tensorfs, train_dataset.abs_poses,
                                          args.pose_prior_lambda_t, args.pose_prior_lambda_r)
             total_loss = total_loss + prior_loss
+            loss_terms["pose_prior"] = prior_loss
             writer.add_scalar("train/pose_prior_loss", prior_loss, global_step=iteration)
 
-        ## Regularization
-        # Get rendered rays schedule
-        if local_tensorfs.regularize and args.loss_flow_weight_inital > 0 or args.loss_depth_weight_inital > 0:
-            depth_map = depth_map.view(view_ids.shape[0], -1)
-            loss_weights = loss_weights.view(view_ids.shape[0], -1)
-            depth_map = depth_map.view(view_ids.shape[0], -1)
+        # Metric depth is an observation term throughout optimisation, with a constant weight.
+        if args.depth_weight > 0:
+            target_depth = torch.from_numpy(data_blob["depths"]).to(args.device)
+            depth_valid = torch.from_numpy(data_blob["depth_valid"]).to(args.device)
+            depth_l1 = dense_depth_loss(depth_map, target_depth, depth_valid)
+            loss_terms["depth"] = args.depth_weight * depth_l1
+            total_loss = total_loss + loss_terms["depth"]
+            writer.add_scalar("train/depth_l1_m", depth_l1, global_step=iteration)
+            writer.add_scalar("train/depth_valid_fraction", depth_valid.float().mean(), global_step=iteration)
+            writer.add_scalar("train/opacity_mean", opacity_map.mean(), global_step=iteration)
+            observed = depth_valid.reshape(-1).bool()
+            low_opacity = (opacity_map.detach() < 1e-4) & observed
+            writer.add_scalar("train/depth_low_opacity_fraction",
+                              low_opacity.sum() / observed.sum().clamp_min(1), global_step=iteration)
+            writer.add_scalar("train/depth_loss", args.depth_weight * depth_l1, global_step=iteration)
 
-            writer.add_scalar("train/reg_loss_weights", reg_loss_weight, global_step=iteration)
-
-        # Optical flow
-        if local_tensorfs.regularize and args.loss_flow_weight_inital > 0:
-            if args.fov == 360:
-                raise NotImplementedError
-            starting_frame_id = max(train_dataset.active_frames_bounds[0] - 1, 0)
-            cam2world = local_tensorfs.get_cam2world(starting_id=starting_frame_id)
-            directions = directions.view(view_ids.shape[0], -1, 3)
-            ij = ij.view(view_ids.shape[0], -1, 2)
-            fwd_flow = torch.from_numpy(data_blob["fwd_flow"]).to(args.device).view(view_ids.shape[0], -1, 2)
-            fwd_mask = torch.from_numpy(data_blob["fwd_mask"]).to(args.device).view(view_ids.shape[0], -1)
-            fwd_mask[view_ids == len(cam2world) - 1] = 0
-            bwd_flow = torch.from_numpy(data_blob["bwd_flow"]).to(args.device).view(view_ids.shape[0], -1, 2)
-            bwd_mask = torch.from_numpy(data_blob["bwd_mask"]).to(args.device).view(view_ids.shape[0], -1)
-            fwd_cam2cams, bwd_cam2cams = get_fwd_bwd_cam2cams(cam2world, view_ids - starting_frame_id)
-                       
-            pts = directions * depth_map[..., None]
-            pred_fwd_flow = get_pred_flow(
-                pts, ij, fwd_cam2cams, local_tensorfs.focal(W), local_tensorfs.center(W, H))
-            pred_bwd_flow = get_pred_flow(
-                pts, ij, bwd_cam2cams, local_tensorfs.focal(W), local_tensorfs.center(W, H))
-            flow_loss_arr =  torch.sum(torch.abs(pred_bwd_flow - bwd_flow), dim=-1) * bwd_mask
-            flow_loss_arr += torch.sum(torch.abs(pred_fwd_flow - fwd_flow), dim=-1) * fwd_mask
-            flow_loss_arr[flow_loss_arr > torch.quantile(flow_loss_arr, 0.9, dim=1)[..., None]] = 0
-
-            flow_loss = (flow_loss_arr).mean() * args.loss_flow_weight_inital * reg_loss_weight / ((W + H) / 2)
-            total_loss = total_loss + flow_loss
-            writer.add_scalar("train/flow_loss", flow_loss, global_step=iteration)
-
-        # Monocular Depth 
-        if local_tensorfs.regularize and args.loss_depth_weight_inital > 0:
-            if args.fov == 360:
-                raise NotImplementedError
-            invdepths = torch.from_numpy(data_blob["invdepths"]).to(args.device)
-            invdepths = invdepths.view(view_ids.shape[0], -1)
-            _, _, depth_loss_arr = compute_depth_loss(1 / depth_map.clamp(1e-6), invdepths)
-            depth_loss_arr[depth_loss_arr > torch.quantile(depth_loss_arr, 0.8, dim=1)[..., None]] = 0
-
-            depth_loss = (depth_loss_arr).mean() * args.loss_depth_weight_inital * reg_loss_weight
-            total_loss = total_loss + depth_loss 
-            writer.add_scalar("train/depth_loss", depth_loss, global_step=iteration)
-
+        # Optional field regularisation keeps the original progressive schedule.
         if  local_tensorfs.regularize:
             loss_tv, l1_loss = local_tensorfs.get_reg_loss(tvreg, args.TV_weight_density, args.TV_weight_app, args.L1_weight)
             total_loss = total_loss + loss_tv + l1_loss
             writer.add_scalar("train/loss_tv", loss_tv, global_step=iteration)
             writer.add_scalar("train/l1_loss", l1_loss, global_step=iteration)
+
+        if args.grad_log_every and iteration % args.grad_log_every == 0:
+            groups = active_gradient_groups(local_tensorfs, optimize_poses, poses_only=train_test_poses)
+            for tag, value in loss_gradient_norms(loss_terms, groups).items():
+                writer.add_scalar(tag, value, global_step=iteration)
+            for name, parameters in groups.items():
+                writer.add_scalar(f"grad/parameter_count/{name}", sum(p.numel() for p in parameters), iteration)
 
         # Optimizes
         if train_test_poses:
@@ -348,7 +355,6 @@ def reconstruction(args):
             if train_dataset.has_left_frames():
                 local_tensorfs.append_rf(n_added_frames)
                 n_added_frames = 0
-                last_add_rf_iter = iteration
 
                 # Remove supervising frames
                 training_frames = (local_tensorfs.blending_weights[:, -1] > 0)
@@ -381,15 +387,8 @@ def reconstruction(args):
             global_step=iteration,
         )
 
-        writer.add_scalar(
-            "train/focal", local_tensorfs.focal(W), global_step=iteration
-        )
-        writer.add_scalar(
-            "train/center0", local_tensorfs.center(W, H)[0].item(), global_step=iteration
-        )
-        writer.add_scalar(
-            "train/center1", local_tensorfs.center(W, H)[1].item(), global_step=iteration
-        )
+        for name, value in zip(("fx", "fy", "cx", "cy"), local_tensorfs.get_intrinsics(W, H)):
+            writer.add_scalar(f"train/{name}", value.item(), global_step=iteration)
 
         writer.add_scalar(
             "active_frames_bounds/0", train_dataset.active_frames_bounds[0], global_step=iteration
@@ -436,15 +435,15 @@ def reconstruction(args):
     with open(f"{logfolder}/checkpoints.th", "wb") as f:
         local_tensorfs.save(f)
 
-    if tracking is not None:
-        export_tracking_trajectory(args, local_tensorfs, train_dataset, tracking, logfolder)
+    if train_dataset.tracking is not None:
+        export_tracking_trajectory(args, local_tensorfs, train_dataset, logfolder)
+
+    writer.close()
 
 
 if __name__ == "__main__":
 
     torch.set_default_dtype(torch.float32)
-    torch.manual_seed(20211202)
-    np.random.seed(20211202)
 
     args = config_parser()
     print(args)

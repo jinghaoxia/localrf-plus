@@ -127,7 +127,9 @@ def load_sequence(dataset_directory, end=None):
             or camera_matrix[0, 0] <= 0 or camera_matrix[1, 1] <= 0
             or not np.allclose(camera_matrix[2], [0, 0, 1])):
         raise ValueError("left_camera.K 必须是有效的 3×3 针孔内参")
-    camera_matrix[:2] /= 3  # 1920x1200 -> 640x400，fx/fy/cx/cy 同步缩放。
+    # OpenCV resize maps integer pixel centres by (p + 0.5) / 3 - 0.5.
+    camera_matrix[:2] /= 3  # 1920x1200 -> 640x400; focal lengths and skew.
+    camera_matrix[:2, 2] += 0.5 / 3 - 0.5
     T_body_camera = np.asarray(calibration["camera_to_body"]["T_body_cam"], float)
     T_body_lidar = np.asarray(calibration["lidar_to_body"]["T_body_lidar"], float)
     for name, matrix in (("T_body_cam", T_body_camera), ("T_body_lidar", T_body_lidar)):
@@ -258,7 +260,7 @@ def estimate_lidar_trajectory(data, visual_poses, visual_observed):
             )
             if use_visual:
                 predicted_pose[:3, 3] = (
-                    expected_body_pose[:3, 3] + predicted_pose[:3, :3] @ T_body_lidar[:3, 3]
+                    expected_body_pose[:3, 3] + lidar_offset_in_world(predicted_pose, T_body_lidar)
                 )
             target_points = voxel_downsample(np.vstack(local_map), 0.8)
             current_scan_pose, statistics = register_scan_to_map(
@@ -327,12 +329,14 @@ def prepare_fusion_points(raw_points, T_body_lidar):
     """保留 2~35 m 点，排除前方抬高候选点，再做 0.5 m 体素采样。"""
     radius = np.linalg.norm(raw_points[:, :2], axis=1)
     valid = np.isfinite(raw_points).all(axis=1) & (radius > 2) & (radius < 35)
-    # 当前 bl 仅 z 平移 1.29 m；固定几何候选框不是通用语义分割。
+    # This fixed foreground box is defined in body axes, not raw LiDAR axes.
+    # It remains a dataset-specific geometric heuristic, not semantic segmentation.
+    body_points = raw_points @ T_body_lidar[:3, :3].T + T_body_lidar[:3, 3]
     front_candidates = (
-        (raw_points[:, 0] > 2)
-        & (raw_points[:, 0] < 12)
-        & (abs(raw_points[:, 1]) < 1.3)
-        & (raw_points[:, 2] + T_body_lidar[2, 3] > 0.35)
+        (body_points[:, 0] > 2)
+        & (body_points[:, 0] < 12)
+        & (abs(body_points[:, 1]) < 1.3)
+        & (body_points[:, 2] > 0.35)
     )
     return voxel_downsample(raw_points[valid & ~front_candidates], 0.5)
 
@@ -1120,6 +1124,24 @@ def refine_visual_pose_with_lidar(
     return current_body_pose, statistics
 
 
+def lidar_offset_in_world(T_world_lidar, T_body_lidar):
+    """Vector from body origin to LiDAR origin, expressed in the world frame."""
+    R_world_body = T_world_lidar[:3, :3] @ T_body_lidar[:3, :3].T
+    return R_world_body @ T_body_lidar[:3, 3]
+
+
+def visual_translation_residual(scan_pose, previous_body_pose, expected_body_pose, T_body_lidar):
+    """Body XY residual and Jacobian for a left rotation / additive world translation step."""
+    world_lidar_offset = lidar_offset_in_world(scan_pose, T_body_lidar)
+    estimated_body_position = scan_pose[:3, 3] - world_lidar_offset
+    previous_body_xy_axes = previous_body_pose[:3, :2].T
+    residual = previous_body_xy_axes @ (estimated_body_position - expected_body_pose[:3, 3])
+    jacobian = previous_body_xy_axes @ np.column_stack(
+        (cross_product_matrix(world_lidar_offset), np.eye(3))
+    )
+    return residual, jacobian
+
+
 # IRLS 点到面优化 + 前帧载体系 XY 位移软约束；不加视觉旋转残差。
 def register_scan_to_map(
     source_points,
@@ -1173,14 +1195,8 @@ def register_scan_to_map(
         weighted_jacobian = plane_jacobian * np.sqrt(huber_weights[:, None])
         weighted_rhs = -plane_errors * np.sqrt(huber_weights)
         if visual_sigma is not None:
-            world_lidar_offset = scan_pose[:3, :3] @ T_body_lidar[:3, 3]
-            estimated_body_position = scan_pose[:3, 3] - world_lidar_offset
-            previous_body_xy_axes = previous_body_pose[:3, :2].T
-            visual_residual = previous_body_xy_axes @ (
-                estimated_body_position - expected_body_pose[:3, 3]
-            )
-            visual_jacobian = previous_body_xy_axes @ np.column_stack(
-                (cross_product_matrix(world_lidar_offset), np.eye(3))
+            visual_residual, visual_jacobian = visual_translation_residual(
+                scan_pose, previous_body_pose, expected_body_pose, T_body_lidar
             )
             visual_weight = 0.04 / visual_sigma
             weighted_jacobian = np.vstack((weighted_jacobian, visual_jacobian * visual_weight))

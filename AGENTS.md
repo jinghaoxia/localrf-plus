@@ -7,7 +7,7 @@
 完整流程分为两阶段：
 
 1. **跟踪前端**：`scripts/estimate_pose.py` 使用矫正左目图像、原始 LiDAR 点云、标定和时间配对表估计米制轨迹。视觉阶段也利用 LiDAR 深度；随后通过扫描与局部地图配准融合视觉运动，输出图像时刻的载体系轨迹。
-2. **神经 BA 后端（当前开发主线）**：显式读取已计算的跟踪轨迹作为初始化与位姿先验，以图像光度误差和相对跟踪初值的位姿正则联合优化位姿与辐射场。此阶段不把原始点云、深度或光流作为优化观测。
+2. **神经 BA 后端（当前开发主线）**：显式读取已计算的跟踪轨迹作为初始化与位姿先验，以图像光度误差、可选米制稠密 z 深度 L1 和相对跟踪初值的位姿正则联合优化位姿与辐射场。此阶段不读取原始点云、光流或 GT;稠密深度来自预先生成的文件。
 
 局部场按时间窗口逐步建立，历史场和归属旧场的位姿停止更新。这是渐进式局部优化；当前范围不包含全轨迹全局 BA、回环、全局位姿图优化、实时系统或动态目标建模。目标数据的图像为三通道重复灰度，重建外观应解释为灰度，不宣称恢复真实颜色。训练与评估均不读取 GT。
 
@@ -16,11 +16,11 @@
 先阅读 `docs/neural-ba-usage.md` 了解当前用法，再阅读 `docs/neural-ba-v1-design.md` 了解设计目标，并与代码核对。设计文档包含尚未实现的规划，README 的上游说明也不直接适用于当前训练入口；描述现有行为时以代码为准，不能把实现偏差自动视为设计目标已变更。
 
 - `scripts/estimate_pose.py`：独立的两阶段跟踪脚本、输入检查与 TUM 导出。
-- `localTensoRF/train.py`：训练入口、跟踪接入、光度与位姿先验损失、渐进式调度、模型保存和轨迹导出。
+- `localTensoRF/train.py`：训练入口、光度/稠密深度与位姿先验损失、渐进式调度、模型保存和轨迹导出。
 - `localTensoRF/opt.py`：实际命令行参数及默认值。
 - `localTensoRF/local_tensorfs.py`：局部场管理、位姿参数与优化器、重叠帧权重、米制射线转换及体渲染调用。
 - `localTensoRF/dataLoader/tracking_poses.py`：TUM 读取、时间匹配、标定与坐标转换、载体系轨迹写出。
-- `localTensoRF/dataLoader/localrf_dataset.py`：图像加载、子序列与跳帧选择、位姿对齐、射线采样和训练帧窗口。
+- `localTensoRF/dataLoader/localrf_dataset.py`：标定及 tracking 接入、图像/米制深度加载、子序列与跳帧对齐、轨迹导出、射线采样和训练帧窗口。
 - `localTensoRF/models/tensoRF.py`、`localTensoRF/models/tensorBase.py`：TensoRF 场表示、空间收缩、采样与体渲染。
 - `localTensoRF/utils/`：射线、几何、损失及可视化辅助函数。
 - `tests/test_tracking_poses.py`：基于合成数据的 CPU 测试。
@@ -31,10 +31,10 @@
 
 - 已接入显式 TUM 轨迹，支持绝对位姿初始化、子序列与跳帧对齐、米制场景半径、多局部场调度及载体系轨迹导出。首个选中帧固定在 tracking 初值；新帧从自身的 tracking 绝对位姿初始化。
 - 当前位姿采用六维旋转表示和独立平移参数；`pose_prior_loss` 使用平移差平方和及旋转矩阵差的 Frobenius 范数平方。它尚不是设计文档中的右乘 SE(3) 指数映射增量及切空间正则。两个先验权重默认均为 0，必须显式设置才能启用先验。
-- 已有 checkpoint 保存与模型加载方法，但训练入口中的恢复逻辑仍是 TODO；不能宣称 `--ckpt` 已支持断点续训。
-- 底层体渲染用于训练；独立视图渲染与留出图像评估流程尚未实现。当前工作区的上游 `localTensoRF/renderer.py` 已删除，不要直接沿用旧渲染命令。
+- 已有 checkpoint 保存与渲染重载，但尚无断点续训；无效的 `--ckpt` 训练参数已移除。
+- `localTensoRF/render.py` 可重载保存视图并导出 RGB、场景内期望 z 深度和不透明度；独立留出评估尚未实现。不要沿用旧 `renderer.py` 命令。
 - 使用说明记录了 16 帧短片段和两个局部场的验证，不能据此宣称整序列或 8 GB 可用显存预算已通过验证。实际设备、CUDA 与可用显存应在目标服务器核查。
-- 当前 tracking 适配器要求矫正图像、零畸变及 `fx ≈ fy`，尚不支持设计要求中的独立双焦距。修改相关逻辑时同步补充投影测试。
+- 当前 tracking 适配器要求矫正图像和零畸变，支持独立双焦距。内参从标定或旧 JSON 元数据自动读取，没有 FOV 或手动 fx/fy/cx/cy CLI。修改相关逻辑时同步补充投影测试。
 
 ## 环境与常用命令
 
@@ -69,27 +69,27 @@ python localTensoRF/train.py \
   --n_iters_per_frame 40 --n_iters_reg 20 --add_frames_every 20 \
   --batch_size 2048 --test_frame_every 0 \
   --L1_weight 0 --TV_weight_density 0 --TV_weight_app 0 \
-  --loss_depth_weight_inital 0 --loss_flow_weight_inital 0 \
+  --depth_weight 0 --seed 20211202 \
   --lr_i_init 0 --lr_exposure_init 0 --uniform_loss_weights 1 \
   --scene_radius_m 8 --pose_prior_lambda_t 0.0156 --pose_prior_lambda_r 1 \
   --vis_every 1000000 --device cuda:0
 ```
 
-这些是短片段示例参数，不是已经验证的整序列配置。不要把全序列估计或训练作为常规检查，也不要因执行 BA 自动重跑 tracking 或自动挑选历史轨迹。
+这些是无深度短片段基线参数，不是已经验证的整序列配置。深度对照在新输出目录显式使用 `--depth_weight 0.0001` 或 `0.001`，211 PNG 同时设置 `--depth_scale 0.01`；可用 `--grad_log_every 20` 记录加权损失对活动参数的梯度。两种权重仅有前 8 帧短预算实验依据，见 `docs/depth-weight-study-2026-11-02.md`。不要把全序列估计或训练作为常规检查，也不要因执行 BA 自动重跑 tracking 或自动挑选历史轨迹。
 
 ## 配置与输出注意事项
 
-- 上游默认启用深度、光流、密度 L1 和曝光优化；本项目两项损失的实验必须显式关闭它们及 TV，并固定内参。保留参数的实际拼写 `inital`。
+- 当前默认关闭深度、密度 L1、TV 和曝光优化，内参默认固定。使用 `--depth_weight` 显式启用米制深度 L1；uint16 PNG 必须指定 `--depth_scale`（211 样本为 0.01 m），二维浮点 .npy 已是米制。旧 flow、逆深度损失及 `inital` CLI 已移除。
 - 全部选中帧参与 BA 时使用 `--test_frame_every 0`。留出实验需设置 `--test_pose_opt 0`，防止测试图像参与位姿更新；这一开关不能替代完整、独立的留出评估流程。
-- `--uniform_loss_weights 1` 会把所有像素权重置为 1，也会取消共用权重数组中的遮罩效果。涉及 `masks/` 时必须单独处理有效像素规则。
+- `--uniform_loss_weights 1` 关闭清晰度加权但保留 `masks/`。深度只监督有限正值且遮罩有效的像素;不做尺度拟合、逆深度或分位数裁剪，空有效批次贡献 0。
 - `--subsequence start end` 使用右端不包含的区间，之后应用 `--frame_step`；图像和位姿必须同步选择。当前位姿先验数据集要求至少选中两帧。
 - `--batch_size` 应为默认采样视图数 16 的倍数；多场切换应保证实际重叠帧数非零，`--n_overlap` 至少为 1。
 - tracking 模式的位姿、`--max_drift`、平移学习率及导出平移均使用米。`--scene_radius_m` 是显式场景收缩半径，默认 8 m；场内部使用除以该半径的坐标，不能因此重缩放导出轨迹。
-- 输出包括 `trajectory.tum`、`tracking_export.json`、`checkpoints.th` 与 TensorBoard 事件。必须使用全新 `--logdir`；代码只对已有 `trajectory.tum` 做拒绝覆盖检查，不能依赖它保护目录内的其他已有文件。
+- 输出包括 `trajectory.tum`、`tracking_export.json`、`checkpoints.th` 与 TensorBoard 事件。必须使用全新或空的 `--logdir`；非空输出目录会被拒绝。
 
 ## 数据、时间与坐标约定
 
-输入图像、PCD、标定和已有实验结果均只读。跟踪输入包含 `images/`、未运动补偿的原始 `pcd/`、`meta/pairs.csv` 和 `meta/calib.yaml`；BA 接入只需图像、这两份元数据和显式指定的 tracking TUM，不加载原始点云。
+输入图像、PCD、标定和已有实验结果均只读。跟踪输入包含 `images/`、未运动补偿的原始 `pcd/`、`meta/pairs.csv` 和 `meta/calib.yaml`；BA 接入需要图像、这两份元数据和显式指定的 tracking TUM，启用深度项时还需 `depth/` 中的同名深度，不加载原始点云。本地只读样本在仓库内 `211/`，包含 31 帧。
 
 - TUM 为 `timestamp tx ty tz qx qy qz qw`，时间单位秒、平移单位米、四元数顺序 xyzw；位姿表示图像时刻的 `T_world_body`，原始序列第 0 帧为单位阵。
 - 通过 `pairs.csv` 的 `output_index` 关联图像，以整数微秒计算 `camera_utc_us - origin_utc_us`，与 TUM 一对一匹配，容限最多 1 微秒。拒绝缺失、重复和非单调时间。当前加载器先验证完整配对表与轨迹，再选择训练片段。

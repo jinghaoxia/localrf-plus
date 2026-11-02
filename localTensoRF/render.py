@@ -11,8 +11,8 @@ weights across fields, and the saved exposure. Output goes to a new directory:
   opacity/NAME.png   accumulated opacity, white = opaque                                    (--save_depth)
                      Depth is sum(weight * z) / sum(weight), i.e. the opacity-weighted mean z along the
                      optical axis (not range). The raw volume-rendering sum is divided by the accumulated
-                     opacity, which the renderer does not return, so it is recovered from the white-background
-                     difference (see render_view). Metres for checkpoints trained with --trajectory
+                     opacity returned by the same forward pass used for training. The forced far boundary
+                     sample is excluded from depth and opacity. Metres for checkpoints trained with --trajectory
                      (scene_radius = --scene_radius_m); checkpoints trained without it store normalised poses.
   metrics.json       per-frame PSNR against the observed image           (needs --datadir)
 
@@ -40,8 +40,7 @@ import cv2
 import numpy as np
 import torch
 
-from local_tensorfs import LocalTensorfs, ids2pixel
-from utils.ray_utils import get_ray_directions_lean, get_rays_lean
+from local_tensorfs import LocalTensorfs
 
 
 def parse_args(argv=None):
@@ -72,6 +71,16 @@ def load_model(checkpoint, device):
     # The stored kwargs give the first field's grid size as saved; LocalTensorfs.load() creates the
     # remaining fields and frames from the state dict.
     kwargs = dict(ckpt["kwargs"], device=device)
+    # Read older single-focal checkpoints without retaining the old camera API in training.
+    if "intrinsics" not in kwargs:
+        if kwargs.pop("fov", None) == 360:
+            raise ValueError("panoramic checkpoints are no longer supported")
+        state = ckpt["state_dict"]
+        state["init_focal"] = state["init_focal"].reshape(1).repeat(2)
+        state["focal_offset"] = state["focal_offset"].reshape(1).repeat(2)
+        center = state["center_rel"].cpu() * torch.tensor(kwargs["WH"])
+        kwargs["intrinsics"] = dict(zip(("fx", "fy", "cx", "cy"),
+                                       [*state["init_focal"].cpu().tolist(), *center.tolist()]))
     with contextlib.redirect_stdout(io.StringIO()):  # TensorBase prints its configuration for every field
         model = LocalTensorfs(**kwargs)
         model.load(ckpt["state_dict"])
@@ -87,7 +96,7 @@ def load_model(checkpoint, device):
 
 @torch.no_grad()
 def render_view(model, view_index, ray_chunk=4096):
-    """Render one stored view. Returns rgb [H, W, 3] in [0, 1] and depth [H, W] in metres (see render_depth)."""
+    """Return RGB [H,W,3] in [0,1] and expected z-depth [H,W] in pose units (tracking: metres)."""
     if float(model.blending_weights[view_index].sum()) <= 0:
         raise RuntimeError(f"view {view_index} has no field with a positive blending weight")
     W, H = model.W, model.H
@@ -96,7 +105,7 @@ def render_view(model, view_index, ray_chunk=4096):
     rgb_chunks, depth_chunks = [], []
     for start in range(0, W * H, ray_chunk):
         ray_ids = torch.arange(start, min(start + ray_chunk, W * H), dtype=torch.long, device=device)
-        rgb, depth, _, _ = model(ray_ids, view_ids, W, H, is_train=False)
+        rgb, depth, _ = model(ray_ids, view_ids, W, H, is_train=False)
         rgb_chunks.append(rgb)
         depth_chunks.append(depth)
     rgb = torch.cat(rgb_chunks).reshape(H, W, 3).cpu().numpy()
@@ -105,90 +114,39 @@ def render_view(model, view_index, ray_chunk=4096):
 
 
 @torch.no_grad()
-def render_depth(model, view_index, ray_chunk=4096):
-    """In-scene weight sum and depth sum for one stored view: returns (depth_sum [H, W] m, opacity [H, W]).
+def render_depth_moment(model, view_index, ray_chunk=4096):
+    """Return (depth_moment, opacity), both [H,W].
 
-    LocalTensorfs.forward cannot be used for depth directly. TensorBase.alpha2weights forces the last sample of
-    every ray opaque, so the returned depth includes the far end of the ray even where nothing in the scene is
-    hit. Here the same samples are weighted but the final one is left out, and the fields are blended with the
-    saved blending weights as in LocalTensorfs.forward. opacity is the in-scene accumulated opacity;
-    depth_sum / opacity is the expected depth of the in-scene surface (see expected_depth).
+    depth_moment = sum(field_blend * sum(sample_weight * z_in_pose_units)).
+    It is the unnormalised first moment, in metres for tracking checkpoints;
+    divide by opacity to obtain expected depth. The far background is excluded.
     """
-    if model.fov == 360:
-        raise NotImplementedError("in-scene depth is implemented for the perspective camera only")
-    if float(model.blending_weights[view_index].sum()) <= 0:
-        raise RuntimeError(f"view {view_index} has no field with a positive blending weight")
     W, H = model.W, model.H
-    device = model.device
-    view_ids = torch.tensor([view_index], dtype=torch.long, device=device)
-    cam2world = model.get_cam2world(view_ids)
-    blending = model.blending_weights[view_ids]
-    depth_sum = torch.zeros(H * W, device=device)
-    opacity = torch.zeros(H * W, device=device)
+    view_ids = torch.tensor([view_index], dtype=torch.long, device=model.device)
+    moment_chunks, opacity_chunks = [], []
     for start in range(0, W * H, ray_chunk):
-        ray_ids = torch.arange(start, min(start + ray_chunk, W * H), dtype=torch.long, device=device)
-        i, j = ids2pixel(W, H, ray_ids)
-        directions = get_ray_directions_lean(i, j, model.focal(W), model.center(W, H))
-        for rf_id, tensorf in enumerate(model.tensorfs):
-            weight = blending[:, rf_id]
-            if float(weight) <= 0:
-                continue
-            cam2rf = cam2world.clone()
-            cam2rf[:, :3, 3] += model.world2rf[rf_id]
-            cam2rf = cam2rf.repeat_interleave(ray_ids.shape[0], dim=0)
-            rays_o, rays_d = get_rays_lean(directions, cam2rf)
-            rays = torch.cat([rays_o / model.scene_radius, rays_d], -1).view(-1, 6)
-            raw, acc = _in_scene_weights(tensorf, rays)
-            depth_sum[start:start + ray_ids.shape[0]] += weight * raw * model.scene_radius
-            opacity[start:start + ray_ids.shape[0]] += weight * acc
-    return depth_sum.reshape(H, W).cpu().numpy(), opacity.reshape(H, W).cpu().numpy()
+        ray_ids = torch.arange(start, min(start + ray_chunk, W * H), device=model.device)
+        _, depth, opacity = model(ray_ids, view_ids, W, H, is_train=False)
+        moment_chunks.append(depth * opacity.clamp_min(1e-8))
+        opacity_chunks.append(opacity)
+    return (torch.cat(moment_chunks).reshape(H, W).cpu().numpy(),
+            torch.cat(opacity_chunks).reshape(H, W).cpu().numpy())
 
 
-def _in_scene_weights(tensorf, rays):
-    """Per-ray in-scene weight sum and sum(weight * z) / |viewdir|, for one field. Mirrors TensorBase.forward
-    up to the density, without the far sample that alpha2weights forces opaque. z is in field units."""
-    viewdirs = rays[:, 3:6]
-    viewdirs_norm = torch.norm(viewdirs, dim=-1, keepdim=True)
-    viewdirs = viewdirs / viewdirs_norm
-    xyz_sampled, z_vals, ray_valid = tensorf.sample_ray_contracted(
-        rays[:, :3], viewdirs, is_train=False, N_samples=-1)
-    dists = torch.cat((z_vals[:, 1:] - z_vals[:, :-1], torch.zeros_like(z_vals[:, :1])), dim=-1)
-    sigma = torch.zeros(xyz_sampled.shape[:-1], device=xyz_sampled.device)
-    if tensorf.alphaMask is not None:
-        alphas = tensorf.alphaMask.sample_alpha(xyz_sampled[ray_valid])
-        alpha_mask = alphas > 0
-        ray_invalid = ~ray_valid
-        ray_invalid[ray_valid] |= (~alpha_mask)
-        ray_valid = ~ray_invalid
-    ray_valid[:, -1] = 0
-    if ray_valid.any():
-        xyz_sampled = tensorf.normalize_coord(xyz_sampled)
-        sigma_feature = tensorf.compute_densityfeature(xyz_sampled[ray_valid])
-        sigma[ray_valid] = tensorf.feature2density(sigma_feature)
-    alpha = 1.0 - torch.exp(-sigma * dists * tensorf.distance_scale)
-    alpha = alpha[:, :-1]  # drop the forced-opaque far sample
-    ones = torch.ones(alpha.shape[0], 1, device=alpha.device)
-    transmittance = torch.cumprod(torch.cat([ones, 1.0 - alpha + 1e-10], -1), -1)[:, :-1]
-    weight = alpha * transmittance
-    depth_sum = torch.sum(weight * z_vals[:, :-1], -1) / viewdirs_norm[:, 0]
-    return depth_sum, torch.sum(weight, -1)
-
-
-def expected_depth(depth_sum, opacity, min_opacity):
-    """Expected in-scene depth in metres: depth_sum / opacity. NaN where the ray hits too little of the scene."""
-    out = np.full(depth_sum.shape, np.nan, dtype=np.float32)
+def expected_depth(depth_moment, opacity, min_opacity):
+    """Normalise the first moment by opacity; NaN below the export confidence threshold."""
+    out = np.full(depth_moment.shape, np.nan, dtype=np.float32)
     ok = opacity >= min_opacity
-    out[ok] = depth_sum[ok] / opacity[ok]
+    out[ok] = depth_moment[ok] / opacity[ok]
     return out
 
 
 def select_frame_names(datadir, subsequence, frame_step):
     """Image names in the order train.py selects them: sorted, then [start:end], then every frame_step-th."""
     names = sorted(p.name for p in (Path(datadir) / "images").iterdir()
-                   if p.is_file() and p.suffix.lower() == ".png")
-    if list(subsequence) != [0, -1]:
-        names = names[subsequence[0]:subsequence[1]]
-    return names[::frame_step]
+                   if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg"))
+    start, end = subsequence
+    return names[start:None if end == -1 else end:frame_step]
 
 
 def load_observed(path, wh):
@@ -266,8 +224,8 @@ def main(argv=None):
         stem = stems[view]
         rgb, _ = render_view(model, view, args.ray_chunk)
         if args.save_depth:
-            depth_sum, acc = render_depth(model, view, args.ray_chunk)
-            depth = expected_depth(depth_sum, acc, args.min_opacity)
+            depth_moment, acc = render_depth_moment(model, view, args.ray_chunk)
+            depth = expected_depth(depth_moment, acc, args.min_opacity)
         write_png(dirs["rgb"] / f"{stem}.png", to_uint8(rgb)[..., ::-1])
         record = {"name": stem, "view_index": view}
         if names is not None:

@@ -12,63 +12,17 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.interpolate import UnivariateSpline
 
-def pts2px(pts, f, center):
-    pts[..., 1] = -pts[..., 1]
-    pts[..., 2] = -pts[..., 2]
-    pts[..., 2] = torch.clip(pts[..., 2].clone(), min=1e-6)
-    return torch.stack(
-        [pts[..., 0] / pts[..., 2] * f + center[0] - 0.5, pts[..., 1] / pts[..., 2] * f + center[1] - 0.5], 
-        dim=-1)
-    
-def inverse_pose(pose):
-    pose_inv = torch.zeros_like(pose)
-    pose_inv[:, :3, :3] = torch.transpose(pose[:, :3, :3], 1, 2)
-    pose_inv[:, :3, 3] = -torch.bmm(pose_inv[:, :3, :3].clone(), pose[:, :3, 3:])[..., 0]
-    return pose_inv
+def dense_depth_loss(predicted, target, valid):
+    """Mean |D_hat - D| over valid observed z-depths, in metres.
 
-def get_cam2cams(cam2worlds, indices, offset):
-    idx = torch.clamp(indices + offset, 0, len(cam2worlds) - 1)
-    world2cam = inverse_pose(cam2worlds[idx])
-    cam2cams = torch.zeros_like(world2cam)
-    cam2cams[:, :3, :3] = torch.bmm(world2cam[:, :3, :3], cam2worlds[indices, :3, :3])
-    cam2cams[:, :3, 3] = torch.bmm(world2cam[:, :3, :3], cam2worlds[indices, :3, 3:])[..., 0]
-    cam2cams[:, :3, 3] += world2cam[:, :3, 3]
-    return cam2cams
+    No inverse depth, per-image scale fit, trimming, or prediction-based mask.
+    Empty observations contribute differentiable zero.
+    """
+    predicted, target, valid = predicted.reshape(-1), target.reshape(-1), valid.reshape(-1)
+    valid = valid.bool() & torch.isfinite(target) & (target > 0)
+    residual = (predicted[valid] - target[valid]).abs()
+    return residual.sum() / valid.sum().clamp_min(1)
 
-def get_fwd_bwd_cam2cams(cam2worlds, indices):
-    fwd_cam2cams = get_cam2cams(cam2worlds, indices, 1)
-    bwd_cam2cams = get_cam2cams(cam2worlds, indices, -1)
-    return fwd_cam2cams, bwd_cam2cams
-
-def get_pred_flow(pts, ij, cam2cams, focal, center):
-    new_pts = torch.transpose(torch.bmm(cam2cams[:, :3, :3], torch.transpose(pts, 1, 2)), 1, 2)
-    new_pts = new_pts + cam2cams[:, None, :3, 3]
-    new_ij = pts2px(new_pts, focal, center)
-
-    return new_ij - ij.float()
-
-def compute_depth_loss(dyn_depth, gt_depth):
-    t_d = torch.median(dyn_depth, dim=-1, keepdim=True).values
-    s_d = torch.mean(torch.abs(dyn_depth - t_d), dim=-1, keepdim=True)
-    dyn_depth_norm = (dyn_depth - t_d) / s_d
-
-    t_gt = torch.median(gt_depth, dim=-1, keepdim=True).values
-    s_gt = torch.mean(torch.abs(gt_depth - t_gt), dim=-1, keepdim=True)
-    gt_depth_norm = (gt_depth - t_gt) / s_gt
-
-    return dyn_depth_norm, gt_depth_norm, (dyn_depth_norm - gt_depth_norm) ** 2
-
-def encode_flow(flow, mask):
-    flow = 2**15 + flow * (2**8)
-    mask &= np.max(flow, axis=-1) < (2**16 - 1)
-    mask &= 0 < np.min(flow, axis=-1)
-    return np.concatenate([flow.astype(np.uint16), mask[..., None].astype(np.uint16) * (2**16 - 1)], axis=-1)
-
-def decode_flow(encoded_flow):
-    flow = encoded_flow[..., :2].astype(np.float32)
-    flow -= 2**15
-    flow /= 2**8
-    return flow, (encoded_flow[..., 2] > 2**15).astype(np.float32)
 
 def get_camera_mesh(pose, depth=1):
     vertices = (

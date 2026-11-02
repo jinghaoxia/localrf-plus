@@ -23,15 +23,10 @@ def config_parser(cmd=None):
         "--downsampling", 
         type=float, 
         default=-1, 
-        help="Downsampling ratio for training and testing. Test views rendered throughout optimization will be downsampled further two times."
+        help="Image downsampling ratio; -1 preserves source resolution."
     )
 
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="TensorVMSplit",
-        choices=["TensorVMSplit", "TensorCP", "TensorVMVt", "TensorMMt"],
-    )
+    parser.add_argument("--seed", type=int, default=20211202, help="Python, NumPy and PyTorch random seed")
 
     # loader options
     parser.add_argument("--batch_size", type=int, default=4096)
@@ -42,7 +37,7 @@ def config_parser(cmd=None):
     parser.add_argument("--lr_t_init", type=float, default=None,
                         help="Translation learning rate; default 5e-4 per normalised unit, i.e. 5e-4 * scene_radius_m per step with --trajectory")
     parser.add_argument("--lr_i_init", type=float, default=0, help="Intrinsics learning rate")
-    parser.add_argument("--lr_exposure_init", type=float, default=1e-3, help="Exposure compensation learning rate")
+    parser.add_argument("--lr_exposure_init", type=float, default=0, help="Exposure compensation learning rate")
     parser.add_argument("--lr_init", type=float, default=0.02, help="learning rate")
     parser.add_argument("--lr_basis", type=float, default=1e-3, help="learning rate")
     parser.add_argument(
@@ -107,16 +102,22 @@ def config_parser(cmd=None):
                         help="Divides number of iterations in progressive optimization scheduling. Multiplies pose lr.")
 
     # losses
-    parser.add_argument("--loss_depth_weight_inital", type=float, default=0.1)
-    parser.add_argument("--loss_flow_weight_inital", type=float, default=1)
-    parser.add_argument("--L1_weight", type=float, default=1e-2, help="loss weight")
+    parser.add_argument("--depth_weight", type=float, default=0.0,
+                        help="weight of mean absolute metric z-depth error; 0 disables loading depth")
+    parser.add_argument("--depth_scale", type=float, default=None,
+                        help="metres per uint16 depth PNG unit (211 sample: 0.01); .npy depth is already in metres")
+    parser.add_argument("--grad_log_every", type=int, default=0,
+                        help="log per-loss gradients on active parameter groups every N steps; 0 disables extra backward passes")
+    parser.add_argument("--L1_weight", type=float, default=0.0, help="loss weight")
     parser.add_argument("--TV_weight_density", type=float, default=0.0, help="loss weight")#0.1
     parser.add_argument("--TV_weight_app", type=float, default=0.0, help="loss weight")#0.01
 
     # model
     # volume options
-    parser.add_argument("--n_lamb_sigma", type=int, default=[8, 8, 8], action="append")
-    parser.add_argument("--n_lamb_sh", type=int, default=[24, 24, 24], action="append")
+    parser.add_argument("--n_lamb_sigma", type=int, default=None, nargs="+", action="extend",
+                        help="three positive density ranks, e.g. --n_lamb_sigma 8 8 8")
+    parser.add_argument("--n_lamb_sh", type=int, default=None, nargs="+", action="extend",
+                        help="three positive appearance ranks, e.g. --n_lamb_sh 24 24 24")
     parser.add_argument("--data_dim_color", type=int, default=27)
 
     parser.add_argument(
@@ -157,25 +158,11 @@ def config_parser(cmd=None):
         "--featureC", type=int, default=128, help="hidden feature channel in MLP"
     )
 
-    parser.add_argument(
-        "--ckpt",
-        type=str,
-        default=None,
-        help="specific weights npy file to reload for coarse network",
-    )
-
     # rendering options
     parser.add_argument("--fea2denseAct", type=str, default="softplus")
-    parser.add_argument(
-        "--nSamples",
-        type=int,
-        default=1e6,
-        help="sample point each ray, pass 1e6 if automatic adjust",
-    )
     parser.add_argument("--step_ratio", type=float, default=0.5)
 
     # Camera model options
-    parser.add_argument("--fov", type=float, default=85.6, help="horizontal FoV in degree")
     parser.add_argument("--with_preprocessed_poses", type=int, default=0)
     parser.add_argument("--trajectory", type=str, default="",
                         help="explicit tracking TUM trajectory (body poses in metres); replaces transforms.json as the pose prior")
@@ -185,20 +172,24 @@ def config_parser(cmd=None):
                         help="weight on squared rotation distance to the tracking prior (needs --trajectory)")
     parser.add_argument("--scene_radius_m", type=float, default=8.0,
                         help="metres at which the contraction starts; full spatial resolution lies inside about this radius (used with --trajectory)")
-    parser.add_argument("--uniform_loss_weights", type=int, default=0,
-                        help="1 disables the per-frame Laplacian sharpness weights in the photometric loss")
-    parser.add_argument("--test_pose_opt", type=int, default=1,
+    parser.add_argument("--uniform_loss_weights", type=int, default=1,
+                        help="1 disables Laplacian sharpness weights while preserving masks")
+    parser.add_argument("--test_pose_opt", type=int, default=0,
                         help="0 forbids pose-only steps on held-out frames, so they never affect poses")
 
     parser.add_argument("--subsequence", default=[0, -1], type=int, nargs=2)
     parser.add_argument('--frame_step', type=int, default=1, help="Step between retained frames")
-    parser.add_argument("--test_frame_every", default=10, type=int, help="Every test_frame_every-th frame is a test frame.")
+    parser.add_argument("--test_frame_every", default=0, type=int, help="Every test_frame_every-th frame is a test frame.")
     # logging/saving options
     parser.add_argument(
-        "--vis_every", type=int, default=10000, help="Frequency of visualize the test images."
+        "--vis_every", type=int, default=10000, help="Iterations between temporary checkpoint saves."
     )
     parser.add_argument("--device", type=str, default="cuda:0")
-    if cmd is not None:
-        return parser.parse_args(cmd)
-    else:
-        return parser.parse_args()
+    args = parser.parse_args(cmd)
+    for name, default in (("n_lamb_sigma", [8, 8, 8]), ("n_lamb_sh", [24, 24, 24])):
+        ranks = getattr(args, name)
+        if ranks is None:
+            setattr(args, name, default)
+        elif len(ranks) != 3 or any(rank <= 0 for rank in ranks):
+            parser.error(f"--{name} requires exactly three positive ranks")
+    return args

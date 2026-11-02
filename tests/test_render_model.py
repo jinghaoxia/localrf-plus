@@ -25,7 +25,7 @@ WH = (16, 10)
 
 def build_model():
     """Two fields, the second upsampled and the first alpha-masked, so the checkpoint exercises both paths."""
-    model = LocalTensorfs(camera_prior=None, fov=85.6, n_init_frames=N_VIEWS, n_overlap=2, WH=WH,
+    model = LocalTensorfs(camera_prior=None, intrinsics={"fx": 9., "fy": 7., "cx": 8., "cy": 5.}, n_init_frames=N_VIEWS, n_overlap=2, WH=WH,
                           n_iters_per_frame=2, n_iters_reg=1, lr_R_init=1e-3, lr_t_init=1e-3, lr_i_init=0,
                           lr_exposure_init=1e-3, rf_lr_init=1e-2, rf_lr_basis=1e-3, lr_decay_target_ratio=0.1,
                           N_voxel_list={}, update_AlphaMask_list=[], lr_upsample_reset=1, device="cpu",
@@ -50,7 +50,7 @@ def build_model():
 
 def wall_model(distance_m, scene_radius):
     """Field whose density is solid beyond z = -distance_m and empty in front of it; z in metres."""
-    model = LocalTensorfs(camera_prior=None, fov=85.6, n_init_frames=1, n_overlap=1, WH=WH,
+    model = LocalTensorfs(camera_prior=None, intrinsics={"fx": 9., "fy": 7., "cx": 8., "cy": 5.}, n_init_frames=1, n_overlap=1, WH=WH,
                           n_iters_per_frame=2, n_iters_reg=1, lr_R_init=1e-3, lr_t_init=1e-3, lr_i_init=0,
                           lr_exposure_init=0, rf_lr_init=1e-2, rf_lr_basis=1e-3, lr_decay_target_ratio=0.1,
                           N_voxel_list={}, update_AlphaMask_list=[], lr_upsample_reset=1, device="cpu",
@@ -102,6 +102,22 @@ class RenderModelTests(unittest.TestCase):
         # The field must produce structure, not a flat background.
         self.assertGreater(rgb.std(), 1e-3)
 
+    def test_legacy_single_focal_checkpoint_is_migrated_for_rendering(self):
+        with torch.no_grad():
+            self.model.init_focal.fill_(9.)
+        ckpt = {"kwargs": self.model.get_kwargs(), "state_dict": self.model.state_dict()}
+        ckpt["kwargs"].pop("intrinsics")
+        ckpt["kwargs"]["fov"] = 85.6
+        for key in ("init_focal", "focal_offset"):
+            ckpt["state_dict"][key] = ckpt["state_dict"][key][:1]
+        torch.save(ckpt, self.checkpoint)
+        loaded = render.load_model(self.checkpoint, "cpu")
+        torch.testing.assert_close(loaded.get_intrinsics(*WH), self.model.get_intrinsics(*WH))
+        rgb, depth = render.render_view(self.model, 2)
+        rgb_loaded, depth_loaded = render.render_view(loaded, 2)
+        np.testing.assert_allclose(rgb_loaded, rgb, atol=1e-6)
+        np.testing.assert_allclose(depth_loaded, depth, atol=1e-6)
+
     def test_ray_chunking_does_not_change_the_image(self):
         model = render.load_model(self.checkpoint, "cpu")
         whole, _ = render.render_view(model, 2, ray_chunk=WH[0] * WH[1])
@@ -111,6 +127,7 @@ class RenderModelTests(unittest.TestCase):
     def test_selection_follows_the_training_order(self):
         data = self.make_dataset(6)
         self.assertEqual(render.select_frame_names(data, [0, -1], 1), [f"{i:05d}.png" for i in range(6)])
+        self.assertEqual(render.select_frame_names(data, [2, -1], 2), ["00002.png", "00004.png"])
         self.assertEqual(render.select_frame_names(data, [1, 5], 2), ["00001.png", "00003.png"])
 
     def test_render_only_writes_rgb_and_depth_for_selected_views(self):
@@ -124,7 +141,7 @@ class RenderModelTests(unittest.TestCase):
         depth = np.load(out / "depth" / "00002.npy")
         self.assertEqual(depth.shape, (WH[1], WH[0]))
         # NaN exactly where the in-scene opacity is below --min_opacity (default 0.5); finite elsewhere.
-        depth_sum, opacity = render.render_depth(render.load_model(self.checkpoint, "cpu"), 2, ray_chunk=50)
+        depth_sum, opacity = render.render_depth_moment(render.load_model(self.checkpoint, "cpu"), 2, ray_chunk=50)
         np.testing.assert_allclose(depth, render.expected_depth(depth_sum, opacity, 0.5), rtol=1e-5, equal_nan=True)
         self.assertTrue(np.isfinite(depth[opacity >= 0.5]).all())
 
@@ -177,19 +194,18 @@ class RenderModelTests(unittest.TestCase):
                 self.assertLess(np.abs(depth - 3.0).max(), 0.5)
 
     def test_in_scene_depth_of_an_opaque_wall(self):
-        # The forward pass adds the far boundary sample; on an opaque wall that sample carries no weight, so the
-        # in-scene expected depth must match the renderer's depth and sit at the wall.
+        # Training and export share the same in-scene expected z-depth.
         model = wall_model(3.0, 8.0)
         _, depth_forward = render.render_view(model, 0, ray_chunk=64)
-        depth_sum, opacity = render.render_depth(model, 0, ray_chunk=64)
+        depth_sum, opacity = render.render_depth_moment(model, 0, ray_chunk=64)
         self.assertGreater(opacity.min(), 0.95)
         self.assertLess(np.abs(render.expected_depth(depth_sum, opacity, 0.5) - 3.0).max(), 0.5)
         self.assertLess(np.abs(depth_sum / opacity - depth_forward).max(), 0.05)
 
     def test_empty_field_has_no_in_scene_depth(self):
         # Negative density everywhere: nothing in the scene absorbs light, so the in-scene opacity is ~0 and the
-        # expected depth must be NaN. The forward pass would report the far boundary (tens of metres) here.
-        depth_sum, opacity = render.render_depth(wall_model(100.0, 8.0), 0, ray_chunk=64)
+        # exported expected depth must be NaN, never the forced far boundary.
+        depth_sum, opacity = render.render_depth_moment(wall_model(100.0, 8.0), 0, ray_chunk=64)
         self.assertLess(opacity.max(), 0.05)
         self.assertTrue(np.isnan(render.expected_depth(depth_sum, opacity, min_opacity=0.5)).all())
 

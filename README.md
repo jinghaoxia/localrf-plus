@@ -1,7 +1,7 @@
 # Progressively Optimized Local Radiance Fields for Robust View Synthesis
 
 This fork's `localTensoRF/train.py` now runs progressive visual neural BA initialized
-from an existing visual–LiDAR tracking trajectory. See the [neural BA usage guide](docs/neural-ba-usage.md)
+from an existing visual–LiDAR tracking trajectory, with optional metric dense-depth supervision and automatically loaded camera intrinsics. See the [neural BA usage guide](docs/neural-ba-usage.md)
 and [design](docs/neural-ba-v1-design.md). The original LocalRF instructions below
 describe the upstream workflow and do not apply to the new training entry point.
 
@@ -45,10 +45,12 @@ python DPT/run_monodepth.py --input_path ${SCENE_DIR}/images --output_path ${SCE
 Alternatively, run `scripts/preprocess_all.sh` to preprocess all hike scenes.
 
 ## Optimization
-```
-python localTensoRF/train.py --datadir ${SCENE_DIR} --logdir ${LOG_DIR} --fov ${FOV}
-```
-After training completion, test views and smoothed trajectories will be stored in `${LOG_DIR}`. We also provide `scripts/train_all.sh` to initiate optimization on several scenes.
+
+Use the [current neural BA usage guide](docs/neural-ba-usage.md). Camera intrinsics
+are loaded from dataset metadata; the former FOV option and optical-flow training
+pipeline have been removed. Dense depth is enabled with `--depth_weight` and an
+explicit `--depth_scale` for uint16 PNG inputs. Progressive local-field training
+and tracking-based pose initialisation remain in the existing training entry point.
 
 ## Citation
 ```

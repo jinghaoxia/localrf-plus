@@ -25,11 +25,10 @@ TINY_FIELD = {"gridSize": [8, 8, 8], "density_n_comp": [2, 2, 2], "appearance_n_
               "fea2denseAct": "softplus", "alphaMask_thres": 1e-4}
 
 
-def build_field(abs_poses, transforms, scene_radius=1.0, n_init_frames=2):
-    prior = {"rel_poses": torch.eye(4).repeat(len(abs_poses), 1, 1), "transforms": transforms,
-             "abs_poses": abs_poses}
+def build_field(abs_poses, intrinsics, scene_radius=1.0, n_init_frames=2):
+    prior = {"abs_poses": abs_poses}
     return LocalTensorfs(
-        camera_prior=prior, fov=85.6, n_init_frames=n_init_frames, n_overlap=1, WH=(8, 6),
+        camera_prior=prior, intrinsics=intrinsics, n_init_frames=n_init_frames, n_overlap=1, WH=(8, 6),
         n_iters_per_frame=2, n_iters_reg=1, lr_R_init=1e-3, lr_t_init=1e-3, lr_i_init=0,
         lr_exposure_init=0, rf_lr_init=1e-2, rf_lr_basis=1e-3, lr_decay_target_ratio=0.1,
         N_voxel_list={}, update_AlphaMask_list=[], lr_upsample_reset=1, device="cpu",
@@ -80,18 +79,18 @@ class TrackingFixture(unittest.TestCase):
 class ConversionTests(TrackingFixture):
     def test_round_trip_recovers_body_poses(self):
         tracking = load_tracking(self.root, self.trajectory)
-        cameras = np.stack([np.array(f["transform_matrix"]) for f in tracking["transforms"]["frames"]])
+        cameras = np.stack([np.array(f["transform_matrix"]) for f in tracking["frames"]])
         restored = camera_to_body(cameras, tracking["T_world_G"], tracking["T_body_cam"])
         np.testing.assert_allclose(restored, np.stack(self.body), atol=1e-6)
 
     def test_first_frame_is_the_camera_frame_G(self):
         tracking = load_tracking(self.root, self.trajectory)
-        np.testing.assert_allclose(tracking["transforms"]["frames"][0]["transform_matrix"], np.eye(4), atol=1e-9)
+        np.testing.assert_allclose(tracking["frames"][0]["transform_matrix"], np.eye(4), atol=1e-9)
 
     def test_principal_point_uses_continuous_pixel_centres(self):
-        transforms = load_tracking(self.root, self.trajectory)["transforms"]
-        self.assertEqual(transforms["principal_point_px"], [4.5, 3.5])
-        self.assertEqual(transforms["fl_x"], 8.0)
+        intrinsics = load_tracking(self.root, self.trajectory)["intrinsics"]
+        self.assertEqual([intrinsics["cx"], intrinsics["cy"]], [4.5, 3.5])
+        self.assertEqual(intrinsics["fx"], 8.0)
 
     def test_rejects_non_identity_first_pose(self):
         self.write_trajectory([self.body[1]] + self.body[1:])
@@ -106,12 +105,12 @@ class ConversionTests(TrackingFixture):
 
 class DatasetAlignmentTests(TrackingFixture):
     def test_subsequence_and_step_keep_metric_poses_aligned_with_images(self):
-        transforms = load_tracking(self.root, self.trajectory)["transforms"]
+        tracking = load_tracking(self.root, self.trajectory)
         data = LocalRFDataset(str(self.root), split="train", n_init_frames=2, subsequence=[1, 6],
-                              frame_step=2, test_frame_every=0, transforms=transforms)
+                              frame_step=2, test_frame_every=0, trajectory=self.trajectory)
         self.assertEqual(data.image_paths, ["00001.png", "00003.png", "00005.png"])
         self.assertEqual(data.pose_scale, 1.0)
-        selected = np.stack([np.array(f["transform_matrix"]) for f in transforms["frames"]
+        selected = np.stack([np.array(f["transform_matrix"]) for f in tracking["frames"]
                              if f["file_path"].split("/")[-1] in data.image_paths])
         np.testing.assert_allclose(data.abs_poses, selected, atol=1e-5)
         # Chaining the relative poses from the first selected frame must rebuild the absolute poses.
@@ -134,16 +133,16 @@ class UnitTests(TrackingFixture):
         self.assertAlmostEqual(float(data.abs_poses[1, 0, 3]), float(self.body[1][0, 3] * expected), places=5)
 
     def test_metric_scene_radius_renders_like_normalised_poses(self):
-        transforms = load_tracking(self.root, self.trajectory)["transforms"]
+        tracking = load_tracking(self.root, self.trajectory)
         data = LocalRFDataset(str(self.root), split="train", n_init_frames=3, test_frame_every=0,
-                              transforms=transforms)
+                              trajectory=self.trajectory)
         radius = 4.0
         normalised = data.abs_poses.copy()
         normalised[:, :3, 3] /= radius  # the same poses expressed in units of the scene radius
         torch.manual_seed(0)
-        metric = build_field(data.abs_poses, transforms, scene_radius=radius, n_init_frames=3)
+        metric = build_field(data.abs_poses, data.intrinsics, scene_radius=radius, n_init_frames=3)
         torch.manual_seed(0)
-        reference = build_field(normalised, transforms, scene_radius=1.0, n_init_frames=3)
+        reference = build_field(normalised, data.intrinsics, scene_radius=1.0, n_init_frames=3)
         ray_ids = torch.arange(8 * 6)
         view_ids = torch.tensor([2])
         with torch.no_grad():
@@ -156,10 +155,10 @@ class UnitTests(TrackingFixture):
 
 class AbsoluteInitTests(TrackingFixture):
     def test_new_frame_starts_at_its_tracking_pose_not_the_optimised_chain(self):
-        transforms = load_tracking(self.root, self.trajectory)["transforms"]
+        tracking = load_tracking(self.root, self.trajectory)
         data = LocalRFDataset(str(self.root), split="train", n_init_frames=2, test_frame_every=0,
-                              transforms=transforms)
-        field = build_field(data.abs_poses, transforms)
+                              trajectory=self.trajectory)
+        field = build_field(data.abs_poses, data.intrinsics)
         np.testing.assert_allclose(field.get_cam2world().detach().numpy(), data.abs_poses[:2, :3], atol=1e-5)
         with torch.no_grad():
             # Simulate an optimisation step on the previous frame, then add the next frame.

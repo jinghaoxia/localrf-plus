@@ -1,14 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-import math
-
 import torch
 from models.tensorBase import AlphaGridMask
 
 from models.tensoRF import TensorVMSplit
 
 from utils.utils import mtx_to_sixD, sixD_to_mtx
-from utils.ray_utils import get_ray_directions_lean, get_rays_lean, get_ray_directions_360
+from utils.ray_utils import get_ray_directions_lean, get_rays_lean
 from utils.utils import N_to_reso
 
 def ids2pixel_view(W, H, ids):
@@ -35,7 +33,7 @@ class LocalTensorfs(torch.nn.Module):
 
     def __init__(
         self,
-        fov,
+        intrinsics,
         n_init_frames,
         n_overlap,
         WH,
@@ -59,8 +57,9 @@ class LocalTensorfs(torch.nn.Module):
 
         super(LocalTensorfs, self).__init__()
 
-        self.fov = fov
         self.n_init_frames = n_init_frames
+        if n_overlap < 1:
+            raise ValueError("n_overlap must be at least 1")
         self.n_overlap = n_overlap
         self.W, self.H = WH
         self.n_iters_per_frame = n_iters_per_frame
@@ -97,27 +96,17 @@ class LocalTensorfs(torch.nn.Module):
         for _ in range(n_init_frames):
             self.append_frame()
 
-        if self.camera_prior is not None:
-            focal = self.camera_prior["transforms"]["fl_x"]
-            focal *= self.W / self.camera_prior["transforms"]["w"]
-        else:
-            fov = fov * math.pi / 180
-            focal = self.W / math.tan(fov / 2) / 2
-        
-        self.init_focal = torch.nn.Parameter(torch.Tensor([focal]).to(self.device))
-
-        self.focal_offset = torch.nn.Parameter(torch.ones(1, device=device))
-        center_rel = 0.5 * torch.ones(2, device=device)
-        if self.camera_prior is not None and "principal_point_px" in self.camera_prior["transforms"]:
-            # Calibrated principal point from the tracking input, as a fraction of the full image size.
-            transforms = self.camera_prior["transforms"]
-            cx, cy = transforms["principal_point_px"]
-            center_rel = torch.tensor([cx / transforms["w"], cy / transforms["h"]], device=device)
-        self.center_rel = torch.nn.Parameter(center_rel)
-
+        values = torch.tensor([intrinsics[k] for k in ("fx", "fy", "cx", "cy")],
+                              dtype=torch.float32, device=self.device)
+        if not torch.isfinite(values).all() or (values[:2] <= 0).any():
+            raise ValueError("intrinsics must have finite fx, fy, cx, cy and positive focal lengths")
+        self.register_buffer("init_focal", values[:2].clone())
+        self.focal_offset = torch.nn.Parameter(torch.ones(2, device=self.device), requires_grad=lr_i_init > 0)
+        self.center_rel = torch.nn.Parameter(values[2:] / values.new_tensor([self.W, self.H]),
+                                             requires_grad=lr_i_init > 0)
         if lr_i_init > 0:
-            self.intrinsic_optimizer = torch.optim.Adam([self.focal_offset, self.center_rel], betas=(0.9, 0.99), lr=self.lr_i_init)
-
+            self.intrinsic_optimizer = torch.optim.Adam([self.focal_offset, self.center_rel],
+                                                        betas=(0.9, 0.99), lr=self.lr_i_init)
 
         # Setup radiance fields
         self.tensorfs = torch.nn.ParameterList()
@@ -129,8 +118,11 @@ class LocalTensorfs(torch.nn.Module):
         self.is_refining = False
         if len(self.tensorfs) > 0:
             n_overlap = min(n_added_frames, self.n_overlap, self.blending_weights.shape[0] - 1)
-            weights_overlap = 1 / n_overlap + torch.arange(
-                0, 1, 1 / n_overlap
+            if n_overlap < 1:
+                raise ValueError("a new field requires at least one overlapping frame")
+            weights_overlap = torch.linspace(
+                1 / n_overlap, 1, n_overlap,
+                device=self.blending_weights.device, dtype=self.blending_weights.dtype,
             )
             self.blending_weights.requires_grad = False
             self.blending_weights[-n_overlap :, -1] = 1 - weights_overlap
@@ -185,7 +177,7 @@ class LocalTensorfs(torch.nn.Module):
                 self.r_c2w[-1] = mtx_to_sixD(abs_pose[None, :3, :3])[0]
                 self.t_c2w[-1].data.copy_(abs_pose[:3, 3])
             else:
-                rel_pose = self.camera_prior["rel_poses"][idx]
+                rel_pose = torch.as_tensor(self.camera_prior["rel_poses"][idx], device=self.device)
                 last_r_c2w = sixD_to_mtx(self.r_c2w[-1].clone().detach()[None])[0]
                 self.r_c2w[-1] = last_r_c2w @ rel_pose[:3, :3]
                 self.t_c2w[-1].data += last_r_c2w @ rel_pose[:3, 3]
@@ -321,7 +313,8 @@ class LocalTensorfs(torch.nn.Module):
     def get_kwargs(self):
         kwargs = {
             "camera_prior": None,
-            "fov": self.fov,
+            "intrinsics": dict(zip(("fx", "fy", "cx", "cy"),
+                                   self.get_intrinsics(self.W, self.H).detach().cpu().tolist())),
             "n_init_frames": self.n_init_frames,
             "n_overlap": self.n_overlap,
             "WH": (self.W, self.H),
@@ -333,7 +326,6 @@ class LocalTensorfs(torch.nn.Module):
             "lr_exposure_init": self.lr_exposure_init,
             "rf_lr_init": self.rf_lr_init,
             "rf_lr_basis": self.rf_lr_basis,
-            "lr_decay_target_ratio": self.lr_decay_target_ratio,
             "lr_decay_target_ratio": self.lr_decay_target_ratio,
             "N_voxel_list": self.N_voxel_per_frame_list,
             "update_AlphaMask_list": self.update_AlphaMask_per_frame_list,
@@ -395,10 +387,11 @@ class LocalTensorfs(torch.nn.Module):
                 l1_loss += self.tensorfs[-1].density_L1() * L1_weight_inital
         return tv_loss, l1_loss
 
-    def focal(self, W):
-        return self.init_focal * self.focal_offset * W / self.W 
-    def center(self, W, H):
-        return torch.Tensor([W, H]).to(self.center_rel) * self.center_rel
+    def get_intrinsics(self, W, H):
+        scale = self.init_focal.new_tensor([W / self.W, H / self.H])
+        focal = self.init_focal * self.focal_offset * scale
+        center = self.center_rel * self.center_rel.new_tensor([W, H])
+        return torch.cat([focal, center])
 
     def forward(
         self,
@@ -406,7 +399,6 @@ class LocalTensorfs(torch.nn.Module):
         view_ids,
         W,
         H,
-        white_bg=True,
         is_train=True,
         cam2world=None,
         world2rf=None,
@@ -416,10 +408,7 @@ class LocalTensorfs(torch.nn.Module):
         floater_thresh=0,
     ):
         i, j = ids2pixel(W, H, ray_ids)
-        if self.fov == 360:
-            directions = get_ray_directions_360(i, j, W, H)
-        else:
-            directions = get_ray_directions_lean(i, j, self.focal(W), self.center(W, H))
+        directions = get_ray_directions_lean(i, j, *self.get_intrinsics(W, H))
 
         if blending_weights is None:
             blending_weights = self.blending_weights[view_ids].clone()
@@ -437,10 +426,8 @@ class LocalTensorfs(torch.nn.Module):
             active_rf_ids = [len(self.tensorfs) - 1]
         else:
             active_rf_ids = torch.nonzero(torch.sum(blending_weights, dim=0))[:, 0].tolist()
-        ij = torch.stack([i, j], dim=-1)
         if len(active_rf_ids) == 0:
-            print("****** No valid RF")
-            return torch.ones([ray_ids.shape[0], 3]), torch.ones_like(ray_ids).float(), torch.ones_like(ray_ids).float(), directions, ij
+            raise ValueError("no local field covers the requested views")
 
         cam2rfs = {}
         initial_devices = []
@@ -458,7 +445,8 @@ class LocalTensorfs(torch.nn.Module):
             cam2rfs[key] = cam2rfs[key].repeat_interleave(ray_ids.shape[0] // view_ids.shape[0], dim=0)
         blending_weights_expanded = blending_weights.repeat_interleave(ray_ids.shape[0] // view_ids.shape[0], dim=0)
         rgbs = torch.zeros_like(directions) 
-        depth_maps = torch.zeros_like(directions[..., 0]) 
+        depth_maps = torch.zeros_like(directions[..., 0])
+        opacity_maps = torch.zeros_like(depth_maps)
         N_rays_all = ray_ids.shape[0]
         chunk = chunk // len(active_rf_ids)
         for chunk_idx in range(N_rays_all // chunk + int(N_rays_all % chunk > 0)):
@@ -476,10 +464,9 @@ class LocalTensorfs(torch.nn.Module):
                 rays_o, rays_d = get_rays_lean(directions_chunk, cam2rf)
                 rays = torch.cat([rays_o / self.scene_radius, rays_d], -1).view(-1, 6)
 
-                rgb_map_t, depth_map_t = self.tensorfs[rf_id](
+                rgb_map_t, depth_map_t, opacity_t = self.tensorfs[rf_id](
                     rays,
                     is_train=is_train,
-                    white_bg=white_bg,
                     N_samples=-1,
                     refine=self.is_refining,
                     floater_thresh=floater_thresh,
@@ -494,8 +481,13 @@ class LocalTensorfs(torch.nn.Module):
                     depth_map_t * blending_weight_chunk
                 )
 
-        # Depth is accumulated in scene_radius units; return metres, as the flow geometry expects.
-        depth_maps = depth_maps * self.scene_radius
+                opacity_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
+                    opacity_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] +
+                    opacity_t * blending_weight_chunk
+                )
+
+        # Blend in-scene depth sums and opacity before normalising. Convert field units to metres.
+        depth_maps = depth_maps * self.scene_radius / opacity_maps.clamp_min(1e-8)
 
         for rf_id, initial_device in zip(active_rf_ids, initial_devices):
             if initial_device != view_ids.device:
@@ -520,4 +512,4 @@ class LocalTensorfs(torch.nn.Module):
             rgbs = torch.bmm(exposure, rgbs[..., None])[..., 0]
         rgbs = rgbs.clamp(0, 1)
 
-        return rgbs, depth_maps, directions, ij
+        return rgbs, depth_maps, opacity_maps

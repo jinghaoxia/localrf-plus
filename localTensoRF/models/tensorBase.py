@@ -368,17 +368,6 @@ class TensorBase(torch.nn.Module):
             "featureC": self.featureC,
         }
 
-    def save(self, se3_poses, path):
-        kwargs = self.get_kwargs()
-        kwargs["se3_poses"] = se3_poses
-        ckpt = {"kwargs": kwargs, "state_dict": self.state_dict()}
-        if self.alphaMask is not None:
-            alpha_volume = self.alphaMask.alpha_volume.bool().cpu().numpy()
-            ckpt.update({"alphaMask.shape": alpha_volume.shape})
-            ckpt.update({"alphaMask.mask": np.packbits(alpha_volume.reshape(-1))})
-            ckpt.update({"alphaMask.aabb": self.alphaMask.aabb.cpu()})
-        torch.save(ckpt, path)
-
     def sample_ray_ndc(self, rays_o, rays_d, is_train=True, N_samples=-1):
         N_samples = N_samples if N_samples > 0 else self.nSamples
         near, far = self.near_far
@@ -553,7 +542,7 @@ class TensorBase(torch.nn.Module):
             sigma[alpha_mask] = validsigma
         
 
-        alpha = 1 - torch.exp(-sigma*length).view(xyz_locs.shape[:-1])
+        alpha = -torch.expm1(-sigma * length).view(xyz_locs.shape[:-1])
 
         return alpha
 
@@ -567,7 +556,6 @@ class TensorBase(torch.nn.Module):
     def forward(
         self,
         rays_chunk,
-        white_bg=True,
         is_train=False,
         N_samples=-1,
         refine=True,
@@ -607,18 +595,23 @@ class TensorBase(torch.nn.Module):
             validsigma = self.feature2density(sigma_feature)
             sigma[ray_valid] = validsigma
 
-        alpha = 1.0 - torch.exp(-sigma * dists * self.distance_scale)
+        # expm1 preserves tiny nonzero opacity in float32 instead of subtracting two values near 1.
+        alpha = -torch.expm1(-sigma * dists * self.distance_scale)
             
         weight, T = alpha2weights(alpha)
         
-        acc_map = torch.sum(weight, -1)
-        depth_map = torch.sum(weight * z_vals, -1) / viewdirs_norm[..., 0]
 
         if floater_thresh > 0:
             idx_map = torch.sum(weight * torch.arange(alpha.shape[1], device=alpha.device)[None], -1, keepdim=True)
             alpha[torch.arange(alpha.shape[1], device=alpha.device)[None] < idx_map * floater_thresh] = 0
             weight, T = alpha2weights(alpha)
         
+        # alpha2weights forces the far boundary opaque for RGB. That boundary is not geometry.
+        # Return in-scene z-depth sums and opacity, with gradients to the density and camera rays.
+        scene_weight = weight[:, :-1]
+        depth_sum = torch.sum(scene_weight * z_vals[:, :-1], -1) / viewdirs_norm[..., 0]
+        scene_opacity = scene_weight.sum(-1)
+
         app_mask = weight > self.rayMarch_weight_thres
         if app_mask.any():
             app_features = self.compute_appfeature(
@@ -630,7 +623,7 @@ class TensorBase(torch.nn.Module):
             rgb[app_mask] = valid_rgbs
 
         rgb_map = torch.sum(weight[..., None] * rgb, -2)
-        if white_bg or (is_train and torch.rand((1,)) < 0.5):
-            rgb_map = rgb_map + (1.0 - acc_map[..., None])
+        # The forced opaque far sample supplies the learned background colour.
+        # Its weight is included in RGB, but excluded from scene depth and opacity.
 
-        return rgb_map, depth_map
+        return rgb_map, depth_sum, scene_opacity

@@ -55,6 +55,26 @@ python localTensoRF/train.py \
 - `tracking_export.json`:轨迹路径、单位、`scene_radius_m`、实际生效的 `max_drift_m`、`lr_t_init_m_per_step` 和先验权重。
 - `checkpoints.th`、`events.*`(TensorBoard)。
 
+## 渲染
+
+`localTensoRF/render.py` 读取 `checkpoints.th`,按训练时保存的优化位姿渲染每个已保存视图。它通过 `LocalTensorfs.forward` 的推理模式渲染:无采样抖动,按保存的混合权重合成各局部场,并应用保存的曝光矩阵。训练时每帧的光度损失只由其最新的局部场计算,因此重叠帧的渲染(多场混合)与训练损失所见的预测可能不同。`--subsequence` 和 `--frame_step` 必须与训练一致:检查点不记录选帧,脚本会比对视图数,不一致时拒绝运行。
+
+```bash
+python localTensoRF/render.py \
+  --checkpoint /path/to/new_run/checkpoints.th \
+  --datadir /path/to/dataprocess/211 --subsequence 0 16 --frame_step 1 \
+  --out /path/to/new_run/render --device cuda:0 --save_depth
+```
+
+`--out` 必须是新目录或空目录,输出为:
+
+- `rgb/`:渲染图(8 位 RGB)。
+- `compare/`:观测 | 渲染 | 误差(放大 4 倍),需要 `--datadir`。
+- `depth/`:沿光轴的 z 深度(不是直线距离;`.npy` 与彩色 PNG),需要 `--save_depth`。深度是场景内期望深度 Σ(w·z)/Σw,只统计场景内的采样点(去掉 `alpha2weights` 强制不透明的远端边界点),并用保存的混合权重合并各场。不透明度低于 `--min_opacity`(默认 0.5)的像素记为 NaN(`.npy`)与黑色(PNG)。`opacity/` 给出累积不透明度(白色为不透明)。单位与位姿一致:用 `--trajectory` 训练的检查点为米;不带 `--trajectory`(上游归一化位姿)训练的检查点为归一化单位,不是米。深度的精度受沿射线的采样步长限制:64³ 网格、R = 8 m 时约 0.22 m。
+- `metrics.json`:逐帧 PSNR 与均值,需要 `--datadir`。
+
+这是对训练所用帧的拟合检查,不是留出评估。不给 `--datadir` 时视图按检查点中的序号命名,且不计算 PSNR。`--ray_chunk`(默认 4096)控制每次前向的射线数,用于降低显存占用;`--stride` 只渲染每隔若干个视图。
+
 ## 位姿先验强度
 
 16 帧、每场 40 次迭代,211 数据,下采样 4 倍,绝对初始化,R = 7.49 m。偏差是相对 tracking 的每帧最大值。`s*` 是 BA 轨迹与 tracking 之间的 Sim(3) 最佳拟合尺度,不使用 GT。
@@ -80,5 +100,5 @@ python localTensoRF/train.py \
 - 多场:新场创建后、第一批新帧挂上之前,先验为零;重叠帧冻结在旧场上。接缝处的台阶等于重叠帧的修正量,尚未在整序列上测量。
 - 留出帧在导出轨迹中是绝对 tracking 初值,未被优化。
 - 首个选中帧的位姿固定在 tracking 值(规范自由度)。
-- 渲染和留出图像评估尚未实现。
+- 留出图像评估尚未实现。`render.py` 只渲染检查点保存的视图(训练帧,以及 `--test_frame_every` 留下的测试帧),不渲染任意新视角。
 - 目前只在 16 帧短片段上验证过,未做整序列和 8 GB 显存测试。

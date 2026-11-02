@@ -4,3 +4,6 @@
 [submodule "RAFT"]
 	path = RAFT
 	url = https://github.com/princeton-vl/RAFT.git
+[submodule "PromptDA"]
+	path = PromptDA
+	url = https://github.com/DepthAnything/PromptDA.git

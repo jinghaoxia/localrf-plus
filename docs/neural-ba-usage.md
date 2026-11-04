@@ -4,7 +4,7 @@
 
 ## 运行
 
-从仓库根目录运行,`--logdir` 必须是新目录或空目录,非空时会拒绝运行。下面以仓库内的 `211` 样本为例:
+从仓库根目录运行,新训练的 `--logdir` 必须是新目录或空目录；显式 `--resume` 才允许继续写入该存档所在的非空目录。下面以仓库内的 `211` 样本为例:
 
 ```bash
 python localTensoRF/train.py \
@@ -18,10 +18,42 @@ python localTensoRF/train.py \
   --depth_weight 0 --lr_exposure_init 0 \
   --uniform_loss_weights 1 --seed 20211202 \
   --scene_radius_m 8 --pose_prior_lambda_t 0.0156 --pose_prior_lambda_r 1 \
-  --vis_every 1000000 --device cuda:0
+  --checkpoint_every 1000 --pose_vis_every 2000 --device cuda:0
 ```
 
 当前默认关闭深度监督、密度 L1、TV 和曝光优化,固定内参,所有选中帧参与训练,使用保留遮罩的统一光度权重。示例作为无深度基线。要检查深度约束,另建输出目录,将 `--depth_weight 0` 改为 `--depth_weight 0.0001 --depth_scale 0.01 --grad_log_every 20`,并与 `0.001` 对照。`1e-4～1e-3` 只是 211 短片段的试验范围,不是整序列已验证的权重;不再以 `0.1` 作为用法示例。`--subsequence` 使用右端不包含的 `[start, end)`,然后应用 `--frame_step`;全部样本为 `[0, 31)`。
+
+## 断点续训（2026-11-04）
+
+新训练默认在开始时、每 **1000 个完整训练步**、每次切换局部场和训练结束时写入续训存档。`--checkpoint_every` 调整步数间隔，必须大于 0；它独立于可选完整渲染快照 `--vis_every`（现默认 0，关闭）。保存位置是固定的 `resume.th`，通过同目录临时文件、fsync 和原子替换提交。写盘失败不会先清空上一份存档。
+
+续训只需要指定新版存档；原始参数自动恢复，速度因子不会重复应用：
+
+```bash
+python localTensoRF/train.py --resume /path/to/new_run/resume.th
+```
+
+默认在存档所在目录继续，TensorBoard 以存档的下一步编号清除旧日志中已被回退的后续记录。也可以写入新的空目录，并在 OOM 后显式降低 batch（仍需为 16 的倍数）：
+
+```bash
+python localTensoRF/train.py \
+  --resume /path/to/new_run/resume.th \
+  --logdir /path/to/resumed_run \
+  --device cuda:0 --batch_size 1024
+```
+
+恢复内容包括全部场/相机参数、Adam 状态、每帧归属、混合权重、细化与升分辨率/alpha mask 调度、活动/预读数据窗口、添加帧计数、下一步编号，以及 Python/NumPy/PyTorch CPU 和训练设备的 CUDA 随机状态。冻结场以 `resume_fields/rf*.th` 分片保存一次，周期性只更新活动场和其他训练状态。**迁移或备份时必须一起保留 `resume.th` 和完整 `resume_fields/` 目录**。恢复时历史场保留在 CPU，仅当前场放到训练设备；历史场仍占用主机内存。
+
+Ctrl+C 或 SIGTERM 会请求完成当前步后保存并退出。CUDA OOM、强制杀进程、断电等使用上一次已提交存档；不保存可能已完成部分优化器更新的异常中间状态。存档间的训练步需要重做，默认最多约 1000 步。若最后一个存档已标记训练结束，重启会补做最终 checkpoint 和轨迹导出。
+
+- `--device`、`--batch_size`、日志/保存频率可以显式调整；batch 或计算设备改变后不承诺逐步数值一致。
+- `--datadir`、`--trajectory` 可用于迁移输入位置，但必须通过一致性校验：选中图像名/内参/留出划分、元数据与轨迹内容、图像/深度/实际使用遮罩的大小和纳秒 mtime。复制数据需保留文件时间。观测大文件没有逐字节内容哈希，保留大小和时间的内容篡改不在此校验范围。
+- 损失权重、选帧、窗口、场结构和学习率/调度不允许在续训时更改。CLI 和 config 文件的显式冲突均会报错。
+- `run_history.jsonl` 追加记录原始参数、有效参数、数据指纹、恢复来源和起始步，便于追溯。
+- `--pose_vis_every` 默认 2000，设为 0 关闭位姿绘图；`--progress_refresh_rate` 只控制控制台进度及资源日志。场边界每步只记录当前场，切场时补记刚完成场的最终边界。CUDA 资源日志包括 allocated/reserved/间隔内峰值和设备剩余显存。
+- 旧 `checkpoints.th/checkpoints_tmp.th` 只包含渲染权重；旧 TensorBoard 日志也缺少训练状态，不能作为 `--resume` 输入。新版训练结束仍生成兼容渲染的 `checkpoints.th`。目前 `render.py` 使用完整渲染 checkpoint，不直接接收分片续训存档。
+
+验证覆盖合成 CPU 多场训练、非零起始片段、深度、曝光/内参优化、非默认速度因子、升分辨率、alpha mask、同目录及新目录续训、SIGTERM 和模拟 OOM/磁盘写入失败。没有在本机验证 CUDA 数值复现、真实 GPU OOM 或完整 211/223 序列；详见 [中断与日志排查记录](training-resume-investigation-2026-11-04.md)。
 
 ## 数据与内参
 
@@ -90,7 +122,9 @@ python localTensoRF/train.py \
 
 - `trajectory.tum`:导出的载体系轨迹,米制,每个选中帧一行。
 - `tracking_export.json`:轨迹路径、单位、`scene_radius_m`、实际生效的 `max_drift_m`、`lr_t_init_m_per_step` 、先验权重、随机种子、深度单位/权重及实际缩放后的初始内参。
-- `checkpoints.th`、`events.*`(TensorBoard)。
+- `checkpoints.th`：训练结束的完整渲染模型；`events.*`：TensorBoard。
+- `resume.th`、`resume_fields/`：周期性分片续训存档，必须一起保留。
+- `run_history.jsonl`：启动/续训参数与来源记录。
 
 ## 渲染
 

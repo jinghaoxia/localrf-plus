@@ -133,12 +133,21 @@ class LocalTensorfs(torch.nn.Module):
                 requires_grad=False,
             )
             world2rf = -self.t_c2w[-1].clone().detach()
+            # Release the old Adam moments before allocating the next field.
+            self.rf_optimizer.zero_grad(set_to_none=True)
+            del self.rf_optimizer
+            self.tensorfs[-1].requires_grad_(False)
             self.tensorfs[-1].to(torch.device("cpu"))
+            for idx in range(len(self.r_c2w)):
+                for optimizers in (self.r_optimizers, self.t_optimizers, self.exp_optimizers):
+                    optimizers[idx].zero_grad(set_to_none=True)
+                    optimizers[idx].state.clear()
             torch.cuda.empty_cache()
         else:
             world2rf = torch.zeros(3, device=self.device)
 
-        self.tensorfs.append(TensorVMSplit(device=self.device, **self.tensorf_args))
+        self.tensorfs.append(TensorVMSplit(device=self.device, **dict(
+            self.tensorf_args, aabb=self.tensorf_args["aabb"].to(self.device))))
 
         self.world2rf.append(world2rf.clone().detach())
         
@@ -265,12 +274,16 @@ class LocalTensorfs(torch.nn.Module):
             reso_cur = N_to_reso(n_voxels, self.tensorfs[-1].aabb)
             self.tensorfs[-1].upsample_volume_grid(reso_cur)
 
+            # Upsampling replaces Parameter objects even when LR reset is disabled.
+            # Adam must point at the new tensors; old moments have incompatible shapes.
+            previous_lrs = [group["lr"] for group in self.rf_optimizer.param_groups]
+            grad_vars = self.tensorfs[-1].get_optparam_groups(self.rf_lr_init, self.rf_lr_basis)
+            self.rf_optimizer = torch.optim.Adam(grad_vars, betas=(0.9, 0.99))
             if self.lr_upsample_reset:
                 print("reset lr to initial")
-                grad_vars = self.tensorfs[-1].get_optparam_groups(
-                    self.rf_lr_init, self.rf_lr_basis
-                )
-                self.rf_optimizer = torch.optim.Adam(grad_vars, betas=(0.9, 0.99))
+            else:
+                for group, lr in zip(self.rf_optimizer.param_groups, previous_lrs):
+                    group["lr"] = lr
 
         # Update alpha mask
         if self.rf_iter[-1] in self.update_AlphaMask_list:
@@ -341,32 +354,47 @@ class LocalTensorfs(torch.nn.Module):
         ckpt = {"kwargs": kwargs, "state_dict": self.state_dict()}
         torch.save(ckpt, path)
 
-    def load(self, state_dict):
-        # TODO A bit hacky?
-        import re
-        n_frames = 0
-        for key in state_dict:
-            if re.fullmatch(r"r_c2w.[0-9]*", key):
-                n_frames += 1
-            if re.fullmatch(r"tensorfs.[1-9][0-9]*.density_plane.0", key):
-                self.tensorf_args["gridSize"] = [state_dict[key].shape[2], state_dict[key].shape[3], state_dict[f"{key[:-15]}density_line.0"].shape[2]]
-                self.append_rf()
+    def load(self, state_dict, field_states=None):
+        """Rebuild shapes on CPU; only the active field is placed on the training device.
 
-        for i in range(len(self.tensorfs)):
-            if f"tensorfs.{i}.alphaMask.aabb" in state_dict:
-                alpha_volume = state_dict[f'tensorfs.{i}.alphaMask.alpha_volume'].to(self.device)
-                aabb = state_dict[f'tensorfs.{i}.alphaMask.aabb'].to(self.device)
-                self.tensorfs[i].alphaMask = AlphaGridMask(self.device, aabb, alpha_volume)
-
-
+        field_states can stream immutable field shards without holding a second copy
+        of all historical fields in memory. Optimizer history is restored separately.
+        """
+        n_fields = state_dict["blending_weights"].shape[1]
+        n_frames = state_dict["blending_weights"].shape[0]
+        self.tensorfs = torch.nn.ParameterList()
+        self.world2rf = torch.nn.ParameterList([
+            torch.nn.Parameter(torch.zeros(3, device=self.device), requires_grad=False)
+            for _ in range(n_fields)])
+        for index in range(n_fields):
+            prefix = f"tensorfs.{index}."
+            field_state = (next(field_states) if field_states is not None else
+                           {key[len(prefix):]: value for key, value in state_dict.items()
+                            if key.startswith(prefix)})
+            plane = field_state["density_plane.0"]
+            grid = [plane.shape[3], plane.shape[2], field_state["density_line.0"].shape[2]]
+            field = TensorVMSplit(device=torch.device("cpu"), **dict(
+                self.tensorf_args, aabb=field_state["aabb"].cpu(), gridSize=grid))
+            if "alphaMask.aabb" in field_state:
+                field.alphaMask = AlphaGridMask("cpu", field_state["alphaMask.aabb"].cpu(),
+                                                field_state["alphaMask.alpha_volume"].cpu())
+            field.load_state_dict(field_state)
+            if index < n_fields - 1:
+                field.requires_grad_(False)
+            else:
+                field.to(self.device)
+            self.tensorfs.append(field)
         for _ in range(n_frames - len(self.r_c2w)):
             self.append_frame()
-        
         self.blending_weights = torch.nn.Parameter(
-            torch.ones_like(state_dict["blending_weights"]), requires_grad=False
-        )
-
-        self.load_state_dict(state_dict)
+            state_dict["blending_weights"].to(self.device), requires_grad=False)
+        other_state = {k: v for k, v in state_dict.items() if not k.startswith("tensorfs.")}
+        result = self.load_state_dict(other_state, strict=False)
+        if result.unexpected_keys or any(not k.startswith("tensorfs.") for k in result.missing_keys):
+            raise ValueError(f"incompatible checkpoint: {result}")
+        self.rf_iter = [0] * n_fields
+        self.rf_optimizer = torch.optim.Adam(
+            self.tensorfs[-1].get_optparam_groups(self.rf_lr_init, self.rf_lr_basis), betas=(0.9, 0.99))
 
     def get_dist_to_last_rf(self):
         return torch.norm(self.t_c2w[-1] + self.world2rf[-1])

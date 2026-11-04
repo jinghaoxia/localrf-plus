@@ -2,6 +2,7 @@
 # Copyright (c) 2022 Anpei Chen
 
 import configargparse
+import sys
 
 def config_parser(cmd=None):
     parser = configargparse.ArgumentParser()
@@ -182,8 +183,13 @@ def config_parser(cmd=None):
     parser.add_argument("--test_frame_every", default=0, type=int, help="Every test_frame_every-th frame is a test frame.")
     # logging/saving options
     parser.add_argument(
-        "--vis_every", type=int, default=10000, help="Iterations between temporary checkpoint saves."
+        "--vis_every", type=int, default=0, help="Optional full rendering snapshot interval; 0 disables (resume saves are independent)."
     )
+    parser.add_argument("--resume", default=None, help="Resume from resume.th (includes optimizer/schedule/RNG state)")
+    parser.add_argument("--checkpoint_every", type=int, default=1000,
+                        help="Save resume.th every N completed steps; field switches always save")
+    parser.add_argument("--pose_vis_every", type=int, default=2000,
+                        help="Iterations between pose images; 0 disables images")
     parser.add_argument("--device", type=str, default="cuda:0")
     args = parser.parse_args(cmd)
     for name, default in (("n_lamb_sigma", [8, 8, 8]), ("n_lamb_sh", [24, 24, 24])):
@@ -192,4 +198,12 @@ def config_parser(cmd=None):
             setattr(args, name, default)
         elif len(ranks) != 3 or any(rank <= 0 for rank in ranks):
             parser.error(f"--{name} requires exactly three positive ranks")
+    # Remember explicit CLI/config options so resume can restore saved defaults
+    # while rejecting accidental changes to the training objective or schedule.
+    tokens = sys.argv[1:] if cmd is None else cmd
+    explicit = {token.split("=", 1)[0][2:] for token in tokens if token.startswith("--")}
+    for source, settings in parser.get_source_to_settings_dict().items():
+        if source.startswith("config_file") or source.startswith("environment_variables"):
+            explicit.update(action.dest for action, value in settings.values() if action is not None)
+    args._explicit_args = sorted(explicit)
     return args

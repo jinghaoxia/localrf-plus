@@ -185,6 +185,22 @@ class LocalRFDataset(Dataset):
 
 
 
+    def restore_window(self, bounds, loaded_frames):
+        """Reload only the saved active/prefetched interval, keeping absolute ray IDs."""
+        start, end = bounds
+        if not 0 <= start < end <= loaded_frames <= self.num_images:
+            raise ValueError("invalid checkpoint dataset window")
+        self.all_rgbs = self.all_depths = self.all_depth_valid = self.all_loss_weights = None
+        self.active_frames_bounds = list(bounds)
+        self.loaded_frames = start
+        chunk = self.frames_chunk
+        try:
+            while self.loaded_frames < loaded_frames:
+                self.frames_chunk = min(chunk, loaded_frames - self.loaded_frames)
+                self.read_meta()
+        finally:
+            self.frames_chunk = chunk
+
     def has_left_frames(self):
         return self.active_frames_bounds[1] < self.num_images
 

@@ -17,6 +17,7 @@
 
 - `scripts/estimate_pose.py`：独立的两阶段跟踪脚本、输入检查与 TUM 导出。
 - `localTensoRF/train.py`：训练入口、光度/稠密深度与位姿先验损失、渐进式调度、模型保存和轨迹导出。
+- `localTensoRF/training_checkpoint.py`：原子分片保存、训练状态恢复、输入一致性及安全步边界停止。
 - `localTensoRF/opt.py`：实际命令行参数及默认值。
 - `localTensoRF/local_tensorfs.py`：局部场管理、位姿参数与优化器、重叠帧权重、米制射线转换及体渲染调用。
 - `localTensoRF/dataLoader/tracking_poses.py`：TUM 读取、时间匹配、标定与坐标转换、载体系轨迹写出。
@@ -31,7 +32,7 @@
 
 - 已接入显式 TUM 轨迹，支持绝对位姿初始化、子序列与跳帧对齐、米制场景半径、多局部场调度及载体系轨迹导出。首个选中帧固定在 tracking 初值；新帧从自身的 tracking 绝对位姿初始化。
 - 当前位姿采用六维旋转表示和独立平移参数；`pose_prior_loss` 使用平移差平方和及旋转矩阵差的 Frobenius 范数平方。它尚不是设计文档中的右乘 SE(3) 指数映射增量及切空间正则。两个先验权重默认均为 0，必须显式设置才能启用先验。
-- 已有 checkpoint 保存与渲染重载，但尚无断点续训；无效的 `--ckpt` 训练参数已移除。
+- 已有渲染 checkpoint 和分片断点续训：`--resume /path/to/resume.th` 恢复参数、优化器、窗口/调度和随机状态；必须同时保留 `resume_fields/`。默认每 1000 步及切场保存；旧渲染 checkpoint/事件日志不可续训。已通过合成 CPU 对照，尚未验证服务器 CUDA/整序列续训。无效的旧 `--ckpt` 参数仍不支持。
 - `localTensoRF/render.py` 可重载保存视图并导出 RGB、场景内期望 z 深度和不透明度；独立留出评估尚未实现。不要沿用旧 `renderer.py` 命令。
 - 使用说明记录了 16 帧短片段和两个局部场的验证，不能据此宣称整序列或 8 GB 可用显存预算已通过验证。实际设备、CUDA 与可用显存应在目标服务器核查。
 - 当前 tracking 适配器要求矫正图像和零畸变，支持独立双焦距。内参从标定或旧 JSON 元数据自动读取，没有 FOV 或手动 fx/fy/cx/cy CLI。修改相关逻辑时同步补充投影测试。
@@ -85,7 +86,7 @@ python localTensoRF/train.py \
 - `--subsequence start end` 使用右端不包含的区间，之后应用 `--frame_step`；图像和位姿必须同步选择。当前位姿先验数据集要求至少选中两帧。
 - `--batch_size` 应为默认采样视图数 16 的倍数；多场切换应保证实际重叠帧数非零，`--n_overlap` 至少为 1。
 - tracking 模式的位姿、`--max_drift`、平移学习率及导出平移均使用米。`--scene_radius_m` 是显式场景收缩半径，默认 8 m；场内部使用除以该半径的坐标，不能因此重缩放导出轨迹。
-- 输出包括 `trajectory.tum`、`tracking_export.json`、`checkpoints.th` 与 TensorBoard 事件。必须使用全新或空的 `--logdir`；非空输出目录会被拒绝。
+- 输出包括 `trajectory.tum`、`tracking_export.json`、`checkpoints.th` 与 TensorBoard 事件。新训练必须使用全新或空的 `--logdir`；显式 `--resume` 可继续写入存档所在目录，或写入新的空目录。续训还输出 `resume.th`、`resume_fields/` 和 `run_history.jsonl`。
 
 ## 数据、时间与坐标约定
 
